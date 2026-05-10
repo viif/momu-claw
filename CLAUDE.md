@@ -25,6 +25,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - 这是学习项目，优先保持实现直接、清晰、容易从头读懂。
 - 因为长期是单文件结构，修改时应控制复杂度，避免为了“工程化”而引入不必要的拆分或抽象。
+- 添加新功能时，要更新 `agent.py` 顶部的功能列表注释，保持文档与代码同步。
 - 如果调整模型接入方式或配置行为，要同时检查代码中的默认值与 `.env.example` 是否一致。
 - 当前仓库里没有看到测试、lint 或 formatter 配置；如果后续新增，再把相应命令补充到本文件。
 
