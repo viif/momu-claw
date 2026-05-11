@@ -5,6 +5,7 @@
 - 简单工具调用
 - 会话持久化: JSONL 保存与恢复
 - 上下文保护: tool_result 截断与历史压缩
+- 多通道输入输出
 """
 
 # -------------------------------------------------------------
@@ -16,7 +17,9 @@ import subprocess
 import sys
 import time
 import uuid
+from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -101,6 +104,105 @@ def extract_text(blocks: Sequence[object]) -> str:
         elif hasattr(block, "text"):
             text += cast(Any, block).text
     return text
+
+
+# -------------------------------------------------------------
+# 通道
+# -------------------------------------------------------------
+@dataclass
+class InboundMessage:
+    """所有通道统一归一化为此结构。"""
+
+    text: str
+    sender_id: str
+    channel: str = ""
+    account_id: str = ""
+    peer_id: str = ""
+    is_group: bool = False
+    reply_to: str = ""
+    reply_kwargs: dict[str, Any] = field(default_factory=dict)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ChannelAccount:
+    """通道账号配置骨架。"""
+
+    channel: str
+    account_id: str
+    token: str = ""
+    config: dict[str, Any] = field(default_factory=dict)
+
+
+def build_session_key(channel: str, account_id: str, peer_id: str) -> str:
+    return f"agent:main:direct:{channel}:{account_id}:{peer_id}"
+
+
+class Channel(ABC):
+    name: str = "unknown"
+
+    @abstractmethod
+    def receive(self) -> InboundMessage | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def send(self, to: str, text: str, **kwargs: Any) -> bool:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        pass
+
+
+class CLIChannel(Channel):
+    name = "cli"
+
+    def __init__(self, account: ChannelAccount) -> None:
+        self.account_id = account.account_id
+
+    def receive(self) -> InboundMessage | None:
+        try:
+            text = input(colored_prompt()).strip()
+        except (KeyboardInterrupt, EOFError):
+            return None
+        if not text:
+            return None
+        return InboundMessage(
+            text=text,
+            sender_id="cli-user",
+            channel=self.name,
+            account_id=self.account_id,
+            peer_id="cli-user",
+            reply_to="cli-user",
+        )
+
+    def send(self, to: str, text: str, **kwargs: Any) -> bool:
+        _ = (to, kwargs)
+        print_assistant(text)
+        return True
+
+
+class ChannelManager:
+    def __init__(self) -> None:
+        self.channels: dict[str, Channel] = {}
+        self.accounts: list[ChannelAccount] = []
+
+    def register(self, channel: Channel) -> None:
+        self.channels[channel.name] = channel
+
+    def list_channels(self) -> list[str]:
+        return list(self.channels.keys())
+
+    def get(self, name: str) -> Channel | None:
+        return self.channels.get(name)
+
+    def broadcast(self, inbound: InboundMessage, text: str) -> None:
+        cli = self.get("cli")
+        if cli is not None:
+            cli.send(inbound.reply_to or inbound.peer_id, text, **inbound.reply_kwargs)
+
+    def close_all(self) -> None:
+        for channel in self.channels.values():
+            channel.close()
 
 
 # -------------------------------------------------------------
@@ -767,6 +869,7 @@ def handle_repl_command(
     store: SessionStore,
     guard: ContextGuard,
     messages: list[dict[str, Any]],
+    mgr: ChannelManager,
 ) -> tuple[bool, list[dict[str, Any]]]:
     """
     处理以 / 开头的命令。
@@ -837,6 +940,19 @@ def handle_repl_command(
         print_session(f"  {len(messages)} -> {len(new_messages)} messages")
         return True, new_messages
 
+    if cmd == "/channels":
+        print_info("  Channels:")
+        for name in mgr.list_channels():
+            print_info(f"    {name}")
+        return True, messages
+
+    if cmd == "/accounts":
+        print_info("  Accounts:")
+        for account in mgr.accounts:
+            token = account.token[:8] + "..." if len(account.token) > 8 else "(none)"
+            print_info(f"    {account.channel}/{account.account_id}  token={token}")
+        return True, messages
+
     if cmd == "/help":
         print_info("  Commands:")
         print_info("    /new [label]       Create a new session")
@@ -844,6 +960,8 @@ def handle_repl_command(
         print_info("    /switch <id>       Switch to a session (prefix match)")
         print_info("    /context           Show context token usage")
         print_info("    /compact           Manually compact conversation history")
+        print_info("    /channels          List registered channels")
+        print_info("    /accounts          List configured accounts")
         print_info("    /help              Show this help")
         print_info("    quit / exit        Exit the REPL")
         return True, messages
@@ -852,11 +970,107 @@ def handle_repl_command(
 
 
 # -------------------------------------------------------------
+# 核心: Agent 回合
+# -------------------------------------------------------------
+def run_agent_turn(
+    inbound: InboundMessage,
+    messages: list[dict[str, Any]],
+    store: SessionStore,
+    guard: ContextGuard,
+    mgr: ChannelManager,
+) -> None:
+    _ = build_session_key(inbound.channel, inbound.account_id, inbound.peer_id)
+
+    messages.append({"role": "user", "content": inbound.text})
+    store.save_turn("user", inbound.text)
+
+    while True:
+        try:
+            response = guard.guard_api_call(
+                api_client=client,
+                model=MODEL_ID,
+                system=SYSTEM_PROMPT,
+                messages=messages,
+                tools=TOOLS,
+            )
+        except Exception as exc:
+            print(f"\n{YELLOW}API Error: {exc}{RESET}\n")
+            while messages and messages[-1]["role"] != "user":
+                messages.pop()
+            if messages:
+                messages.pop()
+            return
+
+        messages.append({"role": "assistant", "content": response.content})
+
+        serialized_content = []
+        for block in response.content:
+            if hasattr(block, "text"):
+                serialized_content.append(
+                    {"type": "text", "text": cast(Any, block).text}
+                )
+            elif is_tool_use_block(block):
+                tool_use_block = cast(Any, block)
+                serialized_content.append(
+                    {
+                        "type": "tool_use",
+                        "id": tool_use_block.id,
+                        "name": tool_use_block.name,
+                        "input": tool_use_block.input,
+                    }
+                )
+        store.save_turn("assistant", serialized_content)
+
+        if response.stop_reason == "end_turn":
+            assistant_text = extract_text(response.content)
+            if assistant_text:
+                mgr.broadcast(inbound, assistant_text)
+            return
+
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            for block in response.content:
+                if not is_tool_use_block(block):
+                    continue
+
+                tool_use_block = cast(Any, block)
+                result = process_tool_call(tool_use_block.name, tool_use_block.input)
+                store.save_tool_result(
+                    tool_use_block.id,
+                    tool_use_block.name,
+                    tool_use_block.input,
+                    result,
+                )
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_block.id,
+                        "content": result,
+                    }
+                )
+
+            messages.append({"role": "user", "content": tool_results})
+            continue
+
+        print_info(f"[stop_reason={response.stop_reason}]")
+        assistant_text = extract_text(response.content)
+        if assistant_text:
+            mgr.broadcast(inbound, assistant_text)
+        return
+
+
+# -------------------------------------------------------------
 # 核心: Agent 循环
 # -------------------------------------------------------------
 def agent_loop() -> None:
     store = SessionStore()
     guard = ContextGuard()
+    mgr = ChannelManager()
+
+    cli_account = ChannelAccount(channel="cli", account_id="cli-local")
+    mgr.accounts.append(cli_account)
+    cli = CLIChannel(cli_account)
+    mgr.register(cli)
 
     # 恢复最近的会话或创建新会话
     sessions = store.list_sessions()
@@ -874,112 +1088,33 @@ def agent_loop() -> None:
     print_info(f"  Workdir: {WORKDIR}")
     print_info(f"  Session: {store.current_session_id}")
     print_info(f"  Tools: {', '.join(TOOL_HANDLERS.keys())}")
+    print_info(f"  Channels: {', '.join(mgr.list_channels())}")
     print_info("  输入 /help 查看命令, 输入 quit 或 exit 退出.")
     print_info("=" * 60)
     print()
 
-    while True:
-        # --- 获取用户输入 ---
-        try:
-            user_input = input(colored_prompt()).strip()
-        except (KeyboardInterrupt, EOFError):
-            print(f"\n{DIM}再见.{RESET}")
-            break
-
-        if not user_input:
-            continue
-
-        if user_input.lower() in ("quit", "exit"):
-            print(f"{DIM}再见.{RESET}")
-            break
-
-        # --- REPL 命令 ---
-        if user_input.startswith("/"):
-            handled, messages = handle_repl_command(user_input, store, guard, messages)
-            if handled:
-                continue
-
-        # --- 追加用户消息 ---
-        messages.append({"role": "user", "content": user_input})
-        store.save_turn("user", user_input)
-
-        # --- 内层循环: 工具调用链 ---
+    try:
         while True:
-            try:
-                response = guard.guard_api_call(
-                    api_client=client,
-                    model=MODEL_ID,
-                    system=SYSTEM_PROMPT,
-                    messages=messages,
-                    tools=TOOLS,
+            inbound = cli.receive()
+            if inbound is None:
+                print(f"\n{DIM}再见.{RESET}")
+                break
+
+            user_input = inbound.text
+            if user_input.lower() in ("quit", "exit"):
+                print(f"{DIM}再见.{RESET}")
+                break
+
+            if user_input.startswith("/"):
+                handled, messages = handle_repl_command(
+                    user_input, store, guard, messages, mgr
                 )
-            except Exception as exc:
-                print(f"\n{YELLOW}API Error: {exc}{RESET}\n")
-                while messages and messages[-1]["role"] != "user":
-                    messages.pop()
-                if messages:
-                    messages.pop()
-                break
+                if handled:
+                    continue
 
-            messages.append({"role": "assistant", "content": response.content})
-
-            # 将内容块序列化为 JSONL 存储格式
-            serialized_content = []
-            for block in response.content:
-                if hasattr(block, "text"):
-                    serialized_content.append(
-                        {"type": "text", "text": cast(Any, block).text}
-                    )
-                elif is_tool_use_block(block):
-                    tool_use_block = cast(Any, block)
-                    serialized_content.append(
-                        {
-                            "type": "tool_use",
-                            "id": tool_use_block.id,
-                            "name": tool_use_block.name,
-                            "input": tool_use_block.input,
-                        }
-                    )
-            store.save_turn("assistant", serialized_content)
-
-            if response.stop_reason == "end_turn":
-                assistant_text = extract_text(response.content)
-                if assistant_text:
-                    print_assistant(assistant_text)
-                break
-
-            if response.stop_reason == "tool_use":
-                tool_results = []
-                for block in response.content:
-                    if not is_tool_use_block(block):
-                        continue
-
-                    tool_use_block = cast(Any, block)
-                    result = process_tool_call(
-                        tool_use_block.name, tool_use_block.input
-                    )
-                    store.save_tool_result(
-                        tool_use_block.id,
-                        tool_use_block.name,
-                        tool_use_block.input,
-                        result,
-                    )
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_block.id,
-                            "content": result,
-                        }
-                    )
-
-                messages.append({"role": "user", "content": tool_results})
-                continue
-
-            print_info(f"[stop_reason={response.stop_reason}]")
-            assistant_text = extract_text(response.content)
-            if assistant_text:
-                print_assistant(assistant_text)
-            break
+            run_agent_turn(inbound, messages, store, guard, mgr)
+    finally:
+        mgr.close_all()
 
 
 # -------------------------------------------------------------
