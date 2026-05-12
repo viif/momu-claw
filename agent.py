@@ -6,7 +6,6 @@
 - 会话持久化: JSONL 保存与恢复
 - 上下文保护: tool_result 截断与历史压缩
 - 多通道输入输出
-- HTTP Webhook Channel
 """
 
 # -------------------------------------------------------------
@@ -199,7 +198,9 @@ class HTTPWebhookChannel(Channel):
         self.port = int(account.config.get("port", HTTP_WEBHOOK_PORT))
         self.path = str(account.config.get("path", HTTP_WEBHOOK_PATH))
         self._queue: queue.Queue[InboundMessage] = queue.Queue()
-        self._server = ThreadingHTTPServer((self.host, self.port), self._build_handler())
+        self._server = ThreadingHTTPServer(
+            (self.host, self.port), self._build_handler()
+        )
         self._server.daemon_threads = True
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
@@ -235,12 +236,16 @@ class HTTPWebhookChannel(Channel):
                     return
 
                 if not isinstance(payload, dict):
-                    self._send_json(400, {"ok": False, "error": "json body must be an object"})
+                    self._send_json(
+                        400, {"ok": False, "error": "json body must be an object"}
+                    )
                     return
 
                 text = payload.get("text")
                 if not isinstance(text, str) or not text.strip():
-                    self._send_json(400, {"ok": False, "error": "field 'text' is required"})
+                    self._send_json(
+                        400, {"ok": False, "error": "field 'text' is required"}
+                    )
                     return
 
                 peer_id = str(
@@ -290,7 +295,9 @@ class HTTPWebhookChannel(Channel):
 
     def start(self) -> None:
         self._thread.start()
-        print_info(f"  HTTP webhook listening on http://{self.host}:{self.port}{self.path}")
+        print_info(
+            f"  HTTP webhook listening on http://{self.host}:{self.port}{self.path}"
+        )
 
     def receive(self) -> InboundMessage | None:
         try:
@@ -329,14 +336,18 @@ class ChannelManager:
     def broadcast(self, inbound: InboundMessage, text: str) -> None:
         target = self.get(inbound.channel) or self.get("cli")
         if target is not None:
-            target.send(inbound.reply_to or inbound.peer_id, text, **inbound.reply_kwargs)
+            target.send(
+                inbound.reply_to or inbound.peer_id, text, **inbound.reply_kwargs
+            )
 
     def close_all(self) -> None:
         for channel in self.channels.values():
             channel.close()
 
 
-def receive_cli_input(outbox: queue.Queue[InboundMessage | None], account_id: str) -> None:
+def receive_cli_input(
+    outbox: queue.Queue[InboundMessage | None], account_id: str
+) -> None:
     while True:
         try:
             text = input(colored_prompt()).strip()
@@ -1274,7 +1285,9 @@ def agent_loop() -> None:
     print_info(f"  Session: {store.current_session_id}")
     print_info(f"  Tools: {', '.join(TOOL_HANDLERS.keys())}")
     print_info(f"  Channels: {', '.join(mgr.list_channels())}")
-    print_info(f"  HTTP Webhook: http://{HTTP_WEBHOOK_HOST}:{HTTP_WEBHOOK_PORT}{HTTP_WEBHOOK_PATH}")
+    print_info(
+        f"  HTTP Webhook: http://{HTTP_WEBHOOK_HOST}:{HTTP_WEBHOOK_PORT}{HTTP_WEBHOOK_PATH}"
+    )
     print_info("  输入 /help 查看命令, 输入 quit 或 exit 退出.")
     print_info("=" * 60)
     print()
