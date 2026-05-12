@@ -6,6 +6,7 @@
 - 会话持久化: JSONL 保存与恢复
 - 上下文保护: tool_result 截断与历史压缩
 - 多通道输入输出
+- HTTP Webhook Channel
 """
 
 # -------------------------------------------------------------
@@ -13,14 +14,17 @@
 # -------------------------------------------------------------
 import json
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, cast
 
@@ -57,6 +61,11 @@ WORKDIR = Path.cwd()
 # 会话目录与上下文保护阈值
 SESSIONS_DIR = WORKDIR / ".sessions"
 CONTEXT_SAFE_LIMIT = 180000
+
+# HTTP Webhook 配置
+HTTP_WEBHOOK_HOST = os.getenv("HTTP_WEBHOOK_HOST", "127.0.0.1")
+HTTP_WEBHOOK_PORT = int(os.getenv("HTTP_WEBHOOK_PORT", "50001"))
+HTTP_WEBHOOK_PATH = os.getenv("HTTP_WEBHOOK_PATH", "/webhook")
 
 
 # --------------------------------------------------------------
@@ -181,6 +190,128 @@ class CLIChannel(Channel):
         return True
 
 
+class HTTPWebhookChannel(Channel):
+    name = "http"
+
+    def __init__(self, account: ChannelAccount) -> None:
+        self.account_id = account.account_id
+        self.host = str(account.config.get("host", HTTP_WEBHOOK_HOST))
+        self.port = int(account.config.get("port", HTTP_WEBHOOK_PORT))
+        self.path = str(account.config.get("path", HTTP_WEBHOOK_PATH))
+        self._queue: queue.Queue[InboundMessage] = queue.Queue()
+        self._server = ThreadingHTTPServer((self.host, self.port), self._build_handler())
+        self._server.daemon_threads = True
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    def _build_handler(self) -> type[BaseHTTPRequestHandler]:
+        channel = self
+
+        class WebhookHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                if self.path != channel.path:
+                    self._send_json(404, {"ok": False, "error": "not found"})
+                    return
+
+                content_length = self.headers.get("Content-Length", "0")
+                try:
+                    body = self.rfile.read(int(content_length))
+                except ValueError:
+                    self._send_json(400, {"ok": False, "error": "invalid json"})
+                    return
+
+                if body.startswith(b"\xef\xbb\xbf"):
+                    body = body[3:]
+
+                try:
+                    payload = json.loads(body or b"{}")
+                except UnicodeDecodeError:
+                    try:
+                        payload = json.loads((body or b"{}").decode("gb18030"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        self._send_json(400, {"ok": False, "error": "invalid json"})
+                        return
+                except json.JSONDecodeError:
+                    self._send_json(400, {"ok": False, "error": "invalid json"})
+                    return
+
+                if not isinstance(payload, dict):
+                    self._send_json(400, {"ok": False, "error": "json body must be an object"})
+                    return
+
+                text = payload.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    self._send_json(400, {"ok": False, "error": "field 'text' is required"})
+                    return
+
+                peer_id = str(
+                    payload.get("peer_id")
+                    or payload.get("sender_id")
+                    or payload.get("reply_to")
+                    or "http-user"
+                )
+                inbound = InboundMessage(
+                    text=text.strip(),
+                    sender_id=str(payload.get("sender_id") or peer_id),
+                    channel=channel.name,
+                    account_id=channel.account_id,
+                    peer_id=peer_id,
+                    reply_to=str(payload.get("reply_to") or peer_id),
+                    raw=payload,
+                )
+                channel.enqueue(inbound)
+                self._send_json(202, {"ok": True, "queued": True})
+
+            def do_GET(self) -> None:
+                if self.path == channel.path:
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "channel": channel.name,
+                            "path": channel.path,
+                            "status": "ready",
+                        },
+                    )
+                    return
+                self._send_json(404, {"ok": False, "error": "not found"})
+
+            def log_message(self, format: str, *args: Any) -> None:
+                _ = format, args
+
+            def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        return WebhookHandler
+
+    def start(self) -> None:
+        self._thread.start()
+        print_info(f"  HTTP webhook listening on http://{self.host}:{self.port}{self.path}")
+
+    def receive(self) -> InboundMessage | None:
+        try:
+            return self._queue.get_nowait()
+        except queue.Empty:
+            return None
+
+    def enqueue(self, inbound: InboundMessage) -> None:
+        self._queue.put(inbound)
+        print_info(f"  [http] queued message from {inbound.peer_id}")
+
+    def send(self, to: str, text: str, **kwargs: Any) -> bool:
+        _ = (to, kwargs)
+        print_assistant(text)
+        return True
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
 class ChannelManager:
     def __init__(self) -> None:
         self.channels: dict[str, Channel] = {}
@@ -196,13 +327,35 @@ class ChannelManager:
         return self.channels.get(name)
 
     def broadcast(self, inbound: InboundMessage, text: str) -> None:
-        cli = self.get("cli")
-        if cli is not None:
-            cli.send(inbound.reply_to or inbound.peer_id, text, **inbound.reply_kwargs)
+        target = self.get(inbound.channel) or self.get("cli")
+        if target is not None:
+            target.send(inbound.reply_to or inbound.peer_id, text, **inbound.reply_kwargs)
 
     def close_all(self) -> None:
         for channel in self.channels.values():
             channel.close()
+
+
+def receive_cli_input(outbox: queue.Queue[InboundMessage | None], account_id: str) -> None:
+    while True:
+        try:
+            text = input(colored_prompt()).strip()
+        except (KeyboardInterrupt, EOFError):
+            outbox.put(None)
+            return
+        if not text:
+            continue
+        outbox.put(
+            InboundMessage(
+                text=text,
+                sender_id="cli-user",
+                channel="cli",
+                account_id=account_id,
+                peer_id="cli-user",
+                reply_to="cli-user",
+            )
+        )
+        return
 
 
 # -------------------------------------------------------------
@@ -1072,6 +1225,38 @@ def agent_loop() -> None:
     cli = CLIChannel(cli_account)
     mgr.register(cli)
 
+    http_account = ChannelAccount(
+        channel="http",
+        account_id="http-local",
+        config={
+            "host": HTTP_WEBHOOK_HOST,
+            "port": HTTP_WEBHOOK_PORT,
+            "path": HTTP_WEBHOOK_PATH,
+        },
+    )
+    mgr.accounts.append(http_account)
+    http_channel = HTTPWebhookChannel(http_account)
+    mgr.register(http_channel)
+    http_channel.start()
+
+    cli_queue: queue.Queue[InboundMessage | None] = queue.Queue()
+    cli_reader_thread: threading.Thread | None = None
+
+    def spawn_cli_reader() -> None:
+        nonlocal cli_reader_thread
+        if cli_reader_thread is not None and cli_reader_thread.is_alive():
+            return
+
+        def run_once() -> None:
+            nonlocal cli_reader_thread
+            try:
+                receive_cli_input(cli_queue, cli_account.account_id)
+            finally:
+                cli_reader_thread = None
+
+        cli_reader_thread = threading.Thread(target=run_once, daemon=True)
+        cli_reader_thread.start()
+
     # 恢复最近的会话或创建新会话
     sessions = store.list_sessions()
     if sessions:
@@ -1089,30 +1274,43 @@ def agent_loop() -> None:
     print_info(f"  Session: {store.current_session_id}")
     print_info(f"  Tools: {', '.join(TOOL_HANDLERS.keys())}")
     print_info(f"  Channels: {', '.join(mgr.list_channels())}")
+    print_info(f"  HTTP Webhook: http://{HTTP_WEBHOOK_HOST}:{HTTP_WEBHOOK_PORT}{HTTP_WEBHOOK_PATH}")
     print_info("  输入 /help 查看命令, 输入 quit 或 exit 退出.")
     print_info("=" * 60)
     print()
 
+    spawn_cli_reader()
+
     try:
         while True:
-            inbound = cli.receive()
+            inbound = http_channel.receive()
+            if inbound is None:
+                try:
+                    inbound = cli_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+
             if inbound is None:
                 print(f"\n{DIM}再见.{RESET}")
                 break
 
             user_input = inbound.text
-            if user_input.lower() in ("quit", "exit"):
+            if inbound.channel == "cli" and user_input.lower() in ("quit", "exit"):
                 print(f"{DIM}再见.{RESET}")
                 break
 
-            if user_input.startswith("/"):
+            if inbound.channel == "cli" and user_input.startswith("/"):
                 handled, messages = handle_repl_command(
                     user_input, store, guard, messages, mgr
                 )
                 if handled:
+                    spawn_cli_reader()
                     continue
 
             run_agent_turn(inbound, messages, store, guard, mgr)
+
+            if inbound.channel == "cli":
+                spawn_cli_reader()
     finally:
         mgr.close_all()
 
