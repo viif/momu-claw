@@ -2,23 +2,26 @@
 极简 Python Agent 网关
 
 支持：
-- 简单工具调用
+- 从 agents.json 加载多 agent 配置
+- 多 agent 独立工作区
+- 五层路由绑定: peer / guild / account / channel / default
 - 会话持久化: JSONL 保存与恢复
 - 上下文保护: tool_result 截断与历史压缩
-- 多通道输入输出
+- 多通道输入输出 (CLI + HTTP webhook)
 """
 
 # -------------------------------------------------------------
 # 导入
 # -------------------------------------------------------------
+import hashlib
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
 import time
-import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -56,6 +59,8 @@ MAX_TOOL_OUTPUT = 50000
 
 # 工作目录 -- 所有文件操作相对于此目录, 防止路径穿越
 WORKDIR = Path.cwd()
+WORKSPACE_DIR = WORKDIR / "workspace"
+AGENTS_CONFIG_PATH = WORKDIR / "agents.json"
 
 # 会话目录与上下文保护阈值
 SESSIONS_DIR = WORKDIR / ".sessions"
@@ -65,6 +70,11 @@ CONTEXT_SAFE_LIMIT = 180000
 HTTP_WEBHOOK_HOST = os.getenv("HTTP_WEBHOOK_HOST", "127.0.0.1")
 HTTP_WEBHOOK_PORT = int(os.getenv("HTTP_WEBHOOK_PORT", "50001"))
 HTTP_WEBHOOK_PATH = os.getenv("HTTP_WEBHOOK_PATH", "/webhook")
+
+# Agent / 路由默认配置
+DEFAULT_AGENT_ID = "main"
+VALID_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+INVALID_CHARS_RE = re.compile(r"[^a-z0-9_-]+")
 
 
 # --------------------------------------------------------------
@@ -78,6 +88,7 @@ DIM = "\033[2m"
 RESET = "\033[0m"
 BOLD = "\033[1m"
 MAGENTA = "\033[35m"
+BLUE = "\033[34m"
 
 
 def colored_prompt() -> str:
@@ -115,6 +126,143 @@ def extract_text(blocks: Sequence[object]) -> str:
 
 
 # -------------------------------------------------------------
+# Agent / 路由
+# -------------------------------------------------------------
+def normalize_agent_id(value: str) -> str:
+    trimmed = value.strip()
+    if not trimmed:
+        return DEFAULT_AGENT_ID
+    lowered = trimmed.lower()
+    if VALID_ID_RE.match(lowered):
+        return lowered
+    cleaned = INVALID_CHARS_RE.sub("-", lowered).strip("-")[:64]
+    return cleaned or DEFAULT_AGENT_ID
+
+
+# dm_scope 控制私聊隔离粒度:
+#   main                      -> agent:{id}:main
+#   per-peer                  -> agent:{id}:direct:{peer}
+#   per-channel-peer          -> agent:{id}:{ch}:direct:{peer}
+#   per-account-channel-peer  -> agent:{id}:{ch}:{acc}:direct:{peer}
+def build_session_key(
+    agent_id: str,
+    channel: str = "",
+    account_id: str = "",
+    peer_id: str = "",
+    dm_scope: str = "per-peer",
+) -> str:
+    aid = normalize_agent_id(agent_id)
+    ch = (channel or "unknown").strip().lower()
+    acc = (account_id or "default").strip().lower()
+    pid = (peer_id or "").strip().lower()
+    if dm_scope == "per-account-channel-peer" and pid:
+        return f"agent:{aid}:{ch}:{acc}:direct:{pid}"
+    if dm_scope == "per-channel-peer" and pid:
+        return f"agent:{aid}:{ch}:direct:{pid}"
+    if dm_scope == "per-peer" and pid:
+        return f"agent:{aid}:direct:{pid}"
+    return f"agent:{aid}:main"
+
+
+@dataclass
+class Binding:
+    agent_id: str
+    tier: int
+    match_key: str
+    match_value: str
+    priority: int = 0
+
+    def display(self) -> str:
+        names = {1: "peer", 2: "guild", 3: "account", 4: "channel", 5: "default"}
+        label = names.get(self.tier, f"tier-{self.tier}")
+        return (
+            f"[{label}] {self.match_key}={self.match_value} -> "
+            f"agent:{self.agent_id} (pri={self.priority})"
+        )
+
+
+class BindingTable:
+    def __init__(self) -> None:
+        self._bindings: list[Binding] = []
+
+    def add(self, binding: Binding) -> None:
+        binding.agent_id = normalize_agent_id(binding.agent_id)
+        self._bindings.append(binding)
+        self._bindings.sort(key=lambda b: (b.tier, -b.priority))
+
+    def remove(self, agent_id: str, match_key: str, match_value: str) -> bool:
+        aid = normalize_agent_id(agent_id)
+        before = len(self._bindings)
+        self._bindings = [
+            b
+            for b in self._bindings
+            if not (
+                b.agent_id == aid
+                and b.match_key == match_key
+                and b.match_value == match_value
+            )
+        ]
+        return len(self._bindings) < before
+
+    def list_all(self) -> list[Binding]:
+        return list(self._bindings)
+
+    def resolve(
+        self,
+        channel: str = "",
+        account_id: str = "",
+        guild_id: str = "",
+        peer_id: str = "",
+    ) -> tuple[str | None, Binding | None]:
+        for binding in self._bindings:
+            if binding.tier == 1 and binding.match_key == "peer_id":
+                if ":" in binding.match_value:
+                    if binding.match_value == f"{channel}:{peer_id}":
+                        return binding.agent_id, binding
+                elif binding.match_value == peer_id:
+                    return binding.agent_id, binding
+            elif (
+                binding.tier == 2
+                and binding.match_key == "guild_id"
+                and binding.match_value == guild_id
+            ):
+                return binding.agent_id, binding
+            elif (
+                binding.tier == 3
+                and binding.match_key == "account_id"
+                and binding.match_value == account_id
+            ):
+                return binding.agent_id, binding
+            elif (
+                binding.tier == 4
+                and binding.match_key == "channel"
+                and binding.match_value == channel
+            ):
+                return binding.agent_id, binding
+            elif binding.tier == 5 and binding.match_key == "default":
+                return binding.agent_id, binding
+        return None, None
+
+
+@dataclass
+class AgentConfig:
+    id: str
+    name: str
+    system_prompt: str = ""
+    model: str = ""
+    dm_scope: str = "per-peer"
+    workspace_dir: str = ""
+
+    @property
+    def effective_model(self) -> str:
+        return self.model or MODEL_ID
+
+    @property
+    def effective_system_prompt(self) -> str:
+        return self.system_prompt or SYSTEM_PROMPT
+
+
+# -------------------------------------------------------------
 # 通道
 # -------------------------------------------------------------
 @dataclass
@@ -126,6 +274,9 @@ class InboundMessage:
     channel: str = ""
     account_id: str = ""
     peer_id: str = ""
+    guild_id: str = ""
+    agent_id: str = ""
+    session_key: str = ""
     is_group: bool = False
     reply_to: str = ""
     reply_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -140,10 +291,6 @@ class ChannelAccount:
     account_id: str
     token: str = ""
     config: dict[str, Any] = field(default_factory=dict)
-
-
-def build_session_key(channel: str, account_id: str, peer_id: str) -> str:
-    return f"agent:main:direct:{channel}:{account_id}:{peer_id}"
 
 
 class Channel(ABC):
@@ -257,10 +404,14 @@ class HTTPWebhookChannel(Channel):
                 inbound = InboundMessage(
                     text=text.strip(),
                     sender_id=str(payload.get("sender_id") or peer_id),
-                    channel=channel.name,
-                    account_id=channel.account_id,
+                    channel=str(payload.get("channel") or channel.name),
+                    account_id=str(payload.get("account_id") or channel.account_id),
                     peer_id=peer_id,
+                    guild_id=str(payload.get("guild_id") or ""),
+                    agent_id=str(payload.get("agent_id") or ""),
+                    session_key=str(payload.get("session_key") or ""),
                     reply_to=str(payload.get("reply_to") or peer_id),
+                    is_group=bool(payload.get("is_group", False)),
                     raw=payload,
                 )
                 channel.enqueue(inbound)
@@ -621,14 +772,14 @@ def is_tool_use_block(block: object) -> bool:
 # SessionStore -- 基于 JSONL 的会话持久化
 # -------------------------------------------------------------
 class SessionStore:
-    """管理 agent 会话的持久化存储。"""
+    """管理多 agent 会话的持久化存储。"""
 
     def __init__(self) -> None:
         self.base_dir = SESSIONS_DIR
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.index_path = self.base_dir / "sessions.json"
         self._index: dict[str, dict[str, Any]] = self._load_index()
-        self.current_session_id: str | None = None
+        self.current_session_key: str | None = None
 
     def _load_index(self) -> dict[str, dict[str, Any]]:
         if self.index_path.exists():
@@ -646,51 +797,86 @@ class SessionStore:
             encoding="utf-8",
         )
 
-    def _session_path(self, session_id: str) -> Path:
-        return self.base_dir / f"{session_id}.jsonl"
+    def _file_name_for_key(self, session_key: str) -> str:
+        digest = hashlib.sha1(session_key.encode("utf-8")).hexdigest()[:16]
+        return f"{digest}.jsonl"
 
-    def create_session(self, label: str = "") -> str:
-        session_id = uuid.uuid4().hex[:12]
+    def _session_path(self, session_key: str) -> Path:
+        return self.base_dir / self._file_name_for_key(session_key)
+
+    def ensure_session(
+        self,
+        agent_id: str,
+        session_key: str,
+        *,
+        label: str = "",
+        channel: str = "",
+        account_id: str = "",
+        peer_id: str = "",
+        guild_id: str = "",
+    ) -> str:
         now = datetime.now(timezone.utc).isoformat()
-        self._index[session_id] = {
-            "label": label,
-            "created_at": now,
-            "last_active": now,
-            "message_count": 0,
-        }
-        self._save_index()
-        self._session_path(session_id).touch()
-        self.current_session_id = session_id
-        return session_id
+        key = session_key
+        meta = self._index.get(key)
+        if meta is None:
+            self._index[key] = {
+                "agent_id": normalize_agent_id(agent_id),
+                "session_key": session_key,
+                "label": label,
+                "channel": channel,
+                "account_id": account_id,
+                "peer_id": peer_id,
+                "guild_id": guild_id,
+                "created_at": now,
+                "last_active": now,
+                "message_count": 0,
+                "file_name": self._file_name_for_key(session_key),
+            }
+            self._save_index()
+            self._session_path(session_key).touch()
+        else:
+            updated = False
+            if not meta.get("agent_id"):
+                meta["agent_id"] = normalize_agent_id(agent_id)
+                updated = True
+            for field_name, value in {
+                "channel": channel,
+                "account_id": account_id,
+                "peer_id": peer_id,
+                "guild_id": guild_id,
+            }.items():
+                if value and not meta.get(field_name):
+                    meta[field_name] = value
+                    updated = True
+            if updated:
+                self._save_index()
+        self.current_session_key = session_key
+        return session_key
 
-    def load_session(self, session_id: str) -> list[dict[str, Any]]:
-        """从 JSONL 重建 API 格式的 messages[]。"""
-        path = self._session_path(session_id)
+    def load_session(self, session_key: str) -> list[dict[str, Any]]:
+        path = self._session_path(session_key)
         if not path.exists():
             return []
-        self.current_session_id = session_id
+        self.current_session_key = session_key
         return self._rebuild_history(path)
 
-    def save_turn(self, role: str, content: Any) -> None:
-        if not self.current_session_id:
-            return
+    def save_turn(self, session_key: str, role: str, content: Any) -> None:
         self.append_transcript(
-            self.current_session_id,
+            session_key,
             {"type": role, "content": content, "ts": time.time()},
         )
 
     def save_tool_result(
         self,
+        session_key: str,
         tool_use_id: str,
         name: str,
         tool_input: dict[str, Any],
         result: str,
     ) -> None:
-        if not self.current_session_id:
-            return
         ts = time.time()
         self.append_transcript(
-            self.current_session_id,
+            session_key,
             {
                 "type": "tool_use",
                 "tool_use_id": tool_use_id,
@@ -700,7 +886,7 @@ class SessionStore:
             },
         )
         self.append_transcript(
-            self.current_session_id,
+            session_key,
             {
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
@@ -709,16 +895,16 @@ class SessionStore:
             },
         )
 
-    def append_transcript(self, session_id: str, record: dict[str, Any]) -> None:
-        path = self._session_path(session_id)
+    def append_transcript(self, session_key: str, record: dict[str, Any]) -> None:
+        path = self._session_path(session_key)
         with open(path, "a", encoding="utf-8") as file:
             file.write(json.dumps(record, ensure_ascii=False) + "\n")
-        if session_id in self._index:
-            self._index[session_id]["last_active"] = datetime.now(
-                timezone.utc
-            ).isoformat()
-            self._index[session_id]["message_count"] += 1
+        meta = self._index.get(session_key)
+        if meta is not None:
+            meta["last_active"] = datetime.now(timezone.utc).isoformat()
+            meta["message_count"] = int(meta.get("message_count", 0)) + 1
             self._save_index()
+        self.current_session_key = session_key
 
     def _rebuild_history(self, path: Path) -> list[dict[str, Any]]:
         """
@@ -790,12 +976,169 @@ class SessionStore:
 
         return messages
 
-    def list_sessions(self) -> list[tuple[str, dict[str, Any]]]:
+    def list_sessions(self, agent_id: str = "") -> list[tuple[str, dict[str, Any]]]:
+        aid = normalize_agent_id(agent_id) if agent_id else ""
         items = list(self._index.items())
+        if aid:
+            items = [item for item in items if item[1].get("agent_id") == aid]
         items.sort(key=lambda item: item[1].get("last_active", ""), reverse=True)
         return items
 
 
+class AgentManager:
+    def __init__(self, workspace_root: Path | None = None) -> None:
+        self.workspace_root = workspace_root or WORKSPACE_DIR
+        self.workspace_root.mkdir(parents=True, exist_ok=True)
+        self._agents: dict[str, AgentConfig] = {}
+        self._sessions: dict[str, list[dict[str, Any]]] = {}
+        self.cli_focus_session_key: str | None = None
+        self.cli_forced_agent_id: str = ""
+
+    def register(self, config: AgentConfig) -> AgentConfig:
+        aid = normalize_agent_id(config.id)
+        workspace_dir = (
+            Path(config.workspace_dir)
+            if config.workspace_dir
+            else self.workspace_root / f"workspace-{aid}"
+        )
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+        normalized = AgentConfig(
+            id=aid,
+            name=config.name or aid,
+            system_prompt=config.system_prompt,
+            model=config.model,
+            dm_scope=config.dm_scope or "per-peer",
+            workspace_dir=str(workspace_dir),
+        )
+        self._agents[aid] = normalized
+        return normalized
+
+    def get_agent(self, agent_id: str) -> AgentConfig | None:
+        return self._agents.get(normalize_agent_id(agent_id))
+
+    def list_agents(self) -> list[AgentConfig]:
+        return list(self._agents.values())
+
+    def get_session(
+        self, session_key: str, store: SessionStore
+    ) -> list[dict[str, Any]]:
+        if session_key not in self._sessions:
+            self._sessions[session_key] = store.load_session(session_key)
+        return self._sessions[session_key]
+
+    def set_cli_focus(self, session_key: str) -> None:
+        self.cli_focus_session_key = session_key
+
+    def set_cli_forced_agent(self, agent_id: str) -> None:
+        self.cli_forced_agent_id = normalize_agent_id(agent_id) if agent_id else ""
+
+
+def load_agents_config() -> list[AgentConfig]:
+    if not AGENTS_CONFIG_PATH.exists():
+        return [
+            AgentConfig(
+                id=DEFAULT_AGENT_ID,
+                name="Main",
+                system_prompt=SYSTEM_PROMPT,
+                model=MODEL_ID,
+                dm_scope="per-account-channel-peer",
+            )
+        ]
+
+    try:
+        raw = json.loads(AGENTS_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print_warn(f"  agents.json 读取失败，回退默认 agent: {exc}")
+        return [
+            AgentConfig(
+                id=DEFAULT_AGENT_ID,
+                name="Main",
+                system_prompt=SYSTEM_PROMPT,
+                model=MODEL_ID,
+                dm_scope="per-account-channel-peer",
+            )
+        ]
+
+    records: list[dict[str, Any]]
+    if isinstance(raw, list):
+        records = [item for item in raw if isinstance(item, dict)]
+    elif isinstance(raw, dict) and isinstance(raw.get("agents"), list):
+        records = [item for item in raw["agents"] if isinstance(item, dict)]
+    else:
+        records = []
+
+    agents: list[AgentConfig] = []
+    for item in records:
+        agents.append(
+            AgentConfig(
+                id=str(item.get("id") or DEFAULT_AGENT_ID),
+                name=str(item.get("name") or item.get("id") or DEFAULT_AGENT_ID),
+                system_prompt=str(item.get("system_prompt") or SYSTEM_PROMPT),
+                model=str(item.get("model") or ""),
+                dm_scope=str(item.get("dm_scope") or "per-account-channel-peer"),
+                workspace_dir=str(item.get("workspace_dir") or ""),
+            )
+        )
+
+    if not agents:
+        agents.append(
+            AgentConfig(
+                id=DEFAULT_AGENT_ID,
+                name="Main",
+                system_prompt=SYSTEM_PROMPT,
+                model=MODEL_ID,
+                dm_scope="per-account-channel-peer",
+            )
+        )
+    return agents
+
+
+def load_default_bindings() -> BindingTable:
+    table = BindingTable()
+    table.add(
+        Binding(
+            agent_id=DEFAULT_AGENT_ID,
+            tier=5,
+            match_key="default",
+            match_value="*",
+            priority=0,
+        )
+    )
+    return table
+
+
+def resolve_route(
+    bindings: BindingTable,
+    agent_mgr: AgentManager,
+    inbound: InboundMessage,
+) -> tuple[str, str, Binding | None]:
+    explicit_agent_id = normalize_agent_id(inbound.agent_id) if inbound.agent_id else ""
+    matched: Binding | None = None
+    if explicit_agent_id:
+        agent_id = explicit_agent_id
+    else:
+        matched_agent_id, matched = bindings.resolve(
+            channel=inbound.channel,
+            account_id=inbound.account_id,
+            guild_id=inbound.guild_id,
+            peer_id=inbound.peer_id,
+        )
+        agent_id = matched_agent_id or DEFAULT_AGENT_ID
+    agent = agent_mgr.get_agent(agent_id)
+    dm_scope = agent.dm_scope if agent else "per-account-channel-peer"
+    session_key = inbound.session_key or build_session_key(
+        agent_id,
+        channel=inbound.channel,
+        account_id=inbound.account_id,
+        peer_id=inbound.peer_id,
+        dm_scope=dm_scope,
+    )
+    return agent_id, session_key, matched
+
+
+# -------------------------------------------------------------
+# ContextGuard -- 上下文溢出保护
+# -------------------------------------------------------------
 def _serialize_messages_for_summary(messages: list[dict[str, Any]]) -> str:
     """将消息列表扁平化为纯文本, 用于 LLM 摘要。"""
     parts: list[str] = []
@@ -824,9 +1167,6 @@ def _serialize_messages_for_summary(messages: list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
-# -------------------------------------------------------------
-# ContextGuard -- 上下文溢出保护
-# -------------------------------------------------------------
 class ContextGuard:
     """保护 agent 免受上下文窗口溢出。"""
 
@@ -885,10 +1225,6 @@ class ContextGuard:
         api_client: Anthropic,
         model: str,
     ) -> list[dict[str, Any]]:
-        """
-        将前 50% 的消息压缩为 LLM 生成的摘要。
-        保留最后 N 条消息 (N = max(4, 总数的 20%)) 不变。
-        """
         total = len(messages)
         if total <= 4:
             return messages
@@ -948,7 +1284,6 @@ class ContextGuard:
     def _truncate_large_tool_results(
         self, messages: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """遍历消息列表, 截断过大的 tool_result 块。"""
         result: list[dict[str, Any]] = []
         for msg in messages:
             content = msg.get("content", "")
@@ -977,12 +1312,6 @@ class ContextGuard:
         tools: list[ToolParam] | None = None,
         max_retries: int = 2,
     ) -> Any:
-        """
-        三阶段重试:
-          第0次尝试: 正常调用
-          第1次尝试: 截断过大的工具结果
-          第2次尝试: 通过 LLM 摘要压缩历史
-        """
         current_messages = messages
 
         for attempt in range(max_retries + 1):
@@ -1028,60 +1357,147 @@ class ContextGuard:
 # -------------------------------------------------------------
 # REPL 命令
 # -------------------------------------------------------------
+def cmd_bindings(bindings: BindingTable) -> None:
+    all_bindings = bindings.list_all()
+    if not all_bindings:
+        print_info("  (no bindings)")
+        return
+    print_info(f"  Route Bindings ({len(all_bindings)}):")
+    colors = [MAGENTA, BLUE, CYAN, GREEN, DIM]
+    for binding in all_bindings:
+        color = colors[min(binding.tier - 1, 4)]
+        print(f"  {color}{binding.display()}{RESET}")
+
+
+def cmd_route(bindings: BindingTable, agents: AgentManager, args: str) -> None:
+    parts = args.strip().split()
+    if len(parts) < 2:
+        print_warn("  用法: /route <channel> <peer_id> [account_id] [guild_id]")
+        return
+    inbound = InboundMessage(
+        text="",
+        sender_id=parts[1],
+        channel=parts[0],
+        peer_id=parts[1],
+        account_id=parts[2] if len(parts) > 2 else "",
+        guild_id=parts[3] if len(parts) > 3 else "",
+    )
+    agent_id, session_key, matched = resolve_route(bindings, agents, inbound)
+    agent = agents.get_agent(agent_id)
+    print_info("  Route Resolution:")
+    print_info(
+        f"    input: ch={inbound.channel} peer={inbound.peer_id} "
+        f"acc={inbound.account_id or '-'} guild={inbound.guild_id or '-'}"
+    )
+    print_info(f"    binding: {matched.display() if matched else 'default fallback'}")
+    print_info(f"    agent: {agent_id} ({agent.name if agent else '?'})")
+    print_info(f"    session: {session_key}")
+
+
+def cmd_agents(agent_mgr: AgentManager) -> None:
+    agents = agent_mgr.list_agents()
+    if not agents:
+        print_info("  (no agents)")
+        return
+    print_info(f"  Agents ({len(agents)}):")
+    for agent in agents:
+        print_info(
+            f"    {agent.id} ({agent.name}) model={agent.effective_model} "
+            f"dm_scope={agent.dm_scope} workspace={agent.workspace_dir}"
+        )
+
+
+def cmd_sessions(
+    store: SessionStore, agent_id: str = "", current_session_key: str = ""
+) -> None:
+    sessions = store.list_sessions(agent_id)
+    if not sessions:
+        print_info("  没有会话记录.")
+        return
+    print_info(f"  Sessions ({len(sessions)}):")
+    for session_key, meta in sessions:
+        label = meta.get("label", "")
+        label_str = f" ({label})" if label else ""
+        count = meta.get("message_count", 0)
+        last = str(meta.get("last_active", "?"))[:19]
+        aid = meta.get("agent_id", "?")
+        active = " <-- current" if session_key == current_session_key else ""
+        print_info(
+            f"    {session_key}{label_str}  agent={aid} msgs={count} last={last}{active}"
+        )
+
+
 def handle_repl_command(
     command: str,
     store: SessionStore,
     guard: ContextGuard,
     messages: list[dict[str, Any]],
     mgr: ChannelManager,
-) -> tuple[bool, list[dict[str, Any]]]:
-    """
-    处理以 / 开头的命令。
-    返回 (是否已处理, messages)。
-    """
+    agent_mgr: AgentManager,
+    bindings: BindingTable,
+) -> tuple[bool, list[dict[str, Any]], str | None]:
     parts = command.strip().split(maxsplit=1)
     cmd = parts[0].lower()
     arg = parts[1] if len(parts) > 1 else ""
 
     if cmd == "/new":
-        label = arg or ""
-        sid = store.create_session(label)
-        print_session(f"  创建新会话: {sid}" + (f" ({label})" if label else ""))
-        return True, []
+        target_agent_id = agent_mgr.cli_forced_agent_id
+        if not target_agent_id:
+            focus_key = agent_mgr.cli_focus_session_key or ""
+            if focus_key.startswith("agent:"):
+                parts = focus_key.split(":", 2)
+                if len(parts) >= 2 and parts[1]:
+                    target_agent_id = parts[1]
+        target_agent_id = normalize_agent_id(target_agent_id or DEFAULT_AGENT_ID)
+        agent = agent_mgr.get_agent(target_agent_id)
+        if agent is None:
+            print_warn(f"  未找到 agent: {target_agent_id}")
+            return True, messages, None
+
+        new_session_key = build_session_key(
+            target_agent_id,
+            channel="cli",
+            account_id="cli-local",
+            peer_id="cli-user",
+            dm_scope=agent.dm_scope,
+        )
+        store.ensure_session(
+            target_agent_id,
+            new_session_key,
+            label=arg,
+            channel="cli",
+            account_id="cli-local",
+            peer_id="cli-user",
+        )
+        agent_mgr.set_cli_focus(new_session_key)
+        store.current_session_key = new_session_key
+        print_session(
+            f"  重置当前 CLI 会话: {new_session_key}" + (f" ({arg})" if arg else "")
+        )
+        return True, [], new_session_key
 
     if cmd == "/list":
-        sessions = store.list_sessions()
-        if not sessions:
-            print_info("  没有会话记录.")
-            return True, messages
-
-        print_info("  会话列表:")
-        for sid, meta in sessions:
-            active = " <-- current" if sid == store.current_session_id else ""
-            label = meta.get("label", "")
-            label_str = f" ({label})" if label else ""
-            count = meta.get("message_count", 0)
-            last = str(meta.get("last_active", "?"))[:19]
-            print_info(f"    {sid}{label_str}  msgs={count}  last={last}{active}")
-        return True, messages
+        cmd_sessions(store, current_session_key=agent_mgr.cli_focus_session_key or "")
+        return True, messages, None
 
     if cmd == "/switch":
         if not arg:
-            print_warn("  用法: /switch <session_id>")
-            return True, messages
-        target_id = arg.strip()
-        matched = [sid for sid in store._index if sid.startswith(target_id)]
+            print_warn("  用法: /switch <session_key前缀>")
+            return True, messages, None
+        target = arg.strip()
+        matched = [key for key in store._index if key.startswith(target)]
         if len(matched) == 0:
-            print_warn(f"  未找到会话: {target_id}")
-            return True, messages
+            print_warn(f"  未找到会话: {target}")
+            return True, messages, None
         if len(matched) > 1:
             print_warn(f"  前缀不唯一，匹配到: {', '.join(matched)}")
-            return True, messages
-
-        sid = matched[0]
-        new_messages = store.load_session(sid)
-        print_session(f"  切换到会话: {sid} ({len(new_messages)} messages)")
-        return True, new_messages
+            return True, messages, None
+        session_key = matched[0]
+        new_messages = store.load_session(session_key)
+        agent_mgr.set_cli_focus(session_key)
+        store.current_session_key = session_key
+        print_session(f"  切换到会话: {session_key} ({len(new_messages)} messages)")
+        return True, new_messages, session_key
 
     if cmd == "/context":
         estimated = guard.estimate_messages_tokens(messages)
@@ -1093,67 +1509,127 @@ def handle_repl_command(
         print_info(f"  Context usage: ~{estimated:,} / {guard.max_tokens:,} tokens")
         print(f"  {color}[{bar}] {pct:.1f}%{RESET}")
         print_info(f"  Messages: {len(messages)}")
-        return True, messages
+        return True, messages, None
 
     if cmd == "/compact":
         if len(messages) <= 4:
             print_info("  消息太少，暂不需要压缩 (需 > 4).")
-            return True, messages
+            return True, messages, None
         print_session("  正在压缩历史...")
         new_messages = guard.compact_history(messages, client, MODEL_ID)
         print_session(f"  {len(messages)} -> {len(new_messages)} messages")
-        return True, new_messages
+        return True, new_messages, None
 
     if cmd == "/channels":
         print_info("  Channels:")
         for name in mgr.list_channels():
             print_info(f"    {name}")
-        return True, messages
+        return True, messages, None
 
     if cmd == "/accounts":
         print_info("  Accounts:")
         for account in mgr.accounts:
             token = account.token[:8] + "..." if len(account.token) > 8 else "(none)"
             print_info(f"    {account.channel}/{account.account_id}  token={token}")
-        return True, messages
+        return True, messages, None
+
+    if cmd == "/agents":
+        cmd_agents(agent_mgr)
+        return True, messages, None
+
+    if cmd == "/bindings":
+        cmd_bindings(bindings)
+        return True, messages, None
+
+    if cmd == "/route":
+        cmd_route(bindings, agent_mgr, arg)
+        return True, messages, None
+
+    if cmd == "/sessions":
+        cmd_sessions(store, arg, agent_mgr.cli_focus_session_key or "")
+        return True, messages, None
+
+    if cmd == "/agent":
+        if not arg:
+            print_info(f"  force={agent_mgr.cli_forced_agent_id or '(off)'}")
+            return True, messages, None
+        if arg.lower() == "off":
+            agent_mgr.set_cli_forced_agent("")
+            routed_agent_id, routed_session_key, _ = resolve_route(
+                bindings,
+                agent_mgr,
+                InboundMessage(
+                    text="",
+                    sender_id="cli-user",
+                    channel="cli",
+                    account_id="cli-local",
+                    peer_id="cli-user",
+                    reply_to="cli-user",
+                ),
+            )
+            store.ensure_session(
+                routed_agent_id,
+                routed_session_key,
+                label="cli",
+                channel="cli",
+                account_id="cli-local",
+                peer_id="cli-user",
+            )
+            new_messages = agent_mgr.get_session(routed_session_key, store)
+            agent_mgr.set_cli_focus(routed_session_key)
+            store.current_session_key = routed_session_key
+            print_info(f"  Routing mode restored. focus={routed_session_key}")
+            return True, new_messages, routed_session_key
+        aid = normalize_agent_id(arg)
+        if agent_mgr.get_agent(aid):
+            agent_mgr.set_cli_forced_agent(aid)
+            print_info(f"  Forcing CLI agent: {aid}")
+        else:
+            print_warn(f"  未找到 agent: {aid}")
+        return True, messages, None
 
     if cmd == "/help":
         print_info("  Commands:")
-        print_info("    /new [label]       Create a new session")
+        print_info("    /new [label]       Reset current CLI session")
         print_info("    /list              List all sessions")
-        print_info("    /switch <id>       Switch to a session (prefix match)")
+        print_info("    /switch <prefix>   Switch CLI focus session")
         print_info("    /context           Show context token usage")
         print_info("    /compact           Manually compact conversation history")
         print_info("    /channels          List registered channels")
         print_info("    /accounts          List configured accounts")
+        print_info("    /agents            List registered agents")
+        print_info("    /bindings          List route bindings")
+        print_info("    /route ...         Preview route resolution")
+        print_info("    /sessions [agent]  List sessions")
+        print_info("    /agent <id|off>    Force CLI agent")
         print_info("    /help              Show this help")
         print_info("    quit / exit        Exit the REPL")
-        return True, messages
+        return True, messages, None
 
-    return False, messages
+    return False, messages, None
 
 
 # -------------------------------------------------------------
 # 核心: Agent 回合
 # -------------------------------------------------------------
-def run_agent_turn(
+def run_agent_session_turn(
     inbound: InboundMessage,
+    agent: AgentConfig,
+    session_key: str,
     messages: list[dict[str, Any]],
     store: SessionStore,
     guard: ContextGuard,
     mgr: ChannelManager,
 ) -> None:
-    _ = build_session_key(inbound.channel, inbound.account_id, inbound.peer_id)
-
     messages.append({"role": "user", "content": inbound.text})
-    store.save_turn("user", inbound.text)
+    store.save_turn(session_key, "user", inbound.text)
 
     while True:
         try:
             response = guard.guard_api_call(
                 api_client=client,
-                model=MODEL_ID,
-                system=SYSTEM_PROMPT,
+                model=agent.effective_model,
+                system=agent.effective_system_prompt,
                 messages=messages,
                 tools=TOOLS,
             )
@@ -1183,7 +1659,7 @@ def run_agent_turn(
                         "input": tool_use_block.input,
                     }
                 )
-        store.save_turn("assistant", serialized_content)
+        store.save_turn(session_key, "assistant", serialized_content)
 
         if response.stop_reason == "end_turn":
             assistant_text = extract_text(response.content)
@@ -1200,6 +1676,7 @@ def run_agent_turn(
                 tool_use_block = cast(Any, block)
                 result = process_tool_call(tool_use_block.name, tool_use_block.input)
                 store.save_tool_result(
+                    session_key,
                     tool_use_block.id,
                     tool_use_block.name,
                     tool_use_block.input,
@@ -1223,6 +1700,68 @@ def run_agent_turn(
         return
 
 
+def dispatch_inbound(
+    inbound: InboundMessage,
+    store: SessionStore,
+    guard: ContextGuard,
+    mgr: ChannelManager,
+    agent_mgr: AgentManager,
+    bindings: BindingTable,
+) -> None:
+    if inbound.channel == "cli":
+        forced_agent_id = agent_mgr.cli_forced_agent_id or inbound.agent_id
+        focus_session_key = agent_mgr.cli_focus_session_key or ""
+        session_key = inbound.session_key
+        if forced_agent_id:
+            expected_prefix = f"agent:{normalize_agent_id(forced_agent_id)}:"
+            if focus_session_key.startswith(expected_prefix):
+                session_key = focus_session_key
+        else:
+            session_key = focus_session_key or inbound.session_key
+        inbound = InboundMessage(
+            text=inbound.text,
+            sender_id=inbound.sender_id,
+            channel=inbound.channel,
+            account_id=inbound.account_id,
+            peer_id=inbound.peer_id,
+            guild_id=inbound.guild_id,
+            agent_id=forced_agent_id,
+            session_key=session_key,
+            is_group=inbound.is_group,
+            reply_to=inbound.reply_to,
+            reply_kwargs=dict(inbound.reply_kwargs),
+            raw=dict(inbound.raw),
+        )
+
+    agent_id, session_key, matched = resolve_route(bindings, agent_mgr, inbound)
+    agent = agent_mgr.get_agent(agent_id)
+    if agent is None:
+        print_warn(f"  未找到 agent: {agent_id}")
+        return
+
+    store.ensure_session(
+        agent_id,
+        session_key,
+        channel=inbound.channel,
+        account_id=inbound.account_id,
+        peer_id=inbound.peer_id,
+        guild_id=inbound.guild_id,
+    )
+    messages = agent_mgr.get_session(session_key, store)
+    if inbound.channel == "cli":
+        agent_mgr.set_cli_focus(session_key)
+
+    if matched is not None:
+        print_info(f"  [route] {matched.display()}")
+    else:
+        print_info(f"  [route] explicit/default -> agent:{agent_id}")
+    print_info(
+        f"  [session] agent={agent_id} workspace={agent.workspace_dir} key={session_key}"
+    )
+
+    run_agent_session_turn(inbound, agent, session_key, messages, store, guard, mgr)
+
+
 # -------------------------------------------------------------
 # 核心: Agent 循环
 # -------------------------------------------------------------
@@ -1230,6 +1769,23 @@ def agent_loop() -> None:
     store = SessionStore()
     guard = ContextGuard()
     mgr = ChannelManager()
+    agent_mgr = AgentManager()
+
+    for config in load_agents_config():
+        agent_mgr.register(config)
+
+    if not agent_mgr.get_agent(DEFAULT_AGENT_ID):
+        agent_mgr.register(
+            AgentConfig(
+                id=DEFAULT_AGENT_ID,
+                name="Main",
+                system_prompt=SYSTEM_PROMPT,
+                model=MODEL_ID,
+                dm_scope="per-account-channel-peer",
+            )
+        )
+
+    bindings = load_default_bindings()
 
     cli_account = ChannelAccount(channel="cli", account_id="cli-local")
     mgr.accounts.append(cli_account)
@@ -1268,21 +1824,36 @@ def agent_loop() -> None:
         cli_reader_thread = threading.Thread(target=run_once, daemon=True)
         cli_reader_thread.start()
 
-    # 恢复最近的会话或创建新会话
-    sessions = store.list_sessions()
-    if sessions:
-        sid = sessions[0][0]
-        messages: list[dict[str, Any]] = store.load_session(sid)
-        print_session(f"  恢复会话: {sid} ({len(messages)} messages)")
-    else:
-        sid = store.create_session("initial")
-        messages = []
-        print_session(f"  创建初始会话: {sid}")
+    cli_default_agent = (
+        agent_mgr.get_agent(DEFAULT_AGENT_ID) or agent_mgr.list_agents()[0]
+    )
+    cli_session_key = build_session_key(
+        cli_default_agent.id,
+        channel="cli",
+        account_id=cli_account.account_id,
+        peer_id="cli-user",
+        dm_scope=cli_default_agent.dm_scope,
+    )
+    store.ensure_session(
+        cli_default_agent.id,
+        cli_session_key,
+        label="cli",
+        channel="cli",
+        account_id=cli_account.account_id,
+        peer_id="cli-user",
+    )
+    cli_messages = agent_mgr.get_session(cli_session_key, store)
+    agent_mgr.set_cli_focus(cli_session_key)
+    print_session(f"  CLI 会话: {cli_session_key} ({len(cli_messages)} messages)")
 
     print_info("=" * 60)
     print_info(f"  Model: {MODEL_ID}")
     print_info(f"  Workdir: {WORKDIR}")
-    print_info(f"  Session: {store.current_session_id}")
+    print_info(f"  Agents config: {AGENTS_CONFIG_PATH.name}")
+    print_info(f"  Agents loaded: {len(agent_mgr.list_agents())}")
+    for agent in agent_mgr.list_agents():
+        print_info(f"    - {agent.id}: workspace={agent.workspace_dir}")
+    print_info(f"  Bindings: {len(bindings.list_all())}")
     print_info(f"  Tools: {', '.join(TOOL_HANDLERS.keys())}")
     print_info(f"  Channels: {', '.join(mgr.list_channels())}")
     print_info(
@@ -1313,14 +1884,26 @@ def agent_loop() -> None:
                 break
 
             if inbound.channel == "cli" and user_input.startswith("/"):
-                handled, messages = handle_repl_command(
-                    user_input, store, guard, messages, mgr
+                focus_key = agent_mgr.cli_focus_session_key or cli_session_key
+                focus_messages = agent_mgr.get_session(focus_key, store)
+                handled, new_messages, new_focus_key = handle_repl_command(
+                    user_input,
+                    store,
+                    guard,
+                    focus_messages,
+                    mgr,
+                    agent_mgr,
+                    bindings,
                 )
                 if handled:
+                    target_focus_key = new_focus_key or focus_key
+                    agent_mgr._sessions[target_focus_key] = new_messages
+                    if new_focus_key and new_focus_key != focus_key:
+                        agent_mgr._sessions.pop(focus_key, None)
                     spawn_cli_reader()
                     continue
 
-            run_agent_turn(inbound, messages, store, guard, mgr)
+            dispatch_inbound(inbound, store, guard, mgr, agent_mgr, bindings)
 
             if inbound.channel == "cli":
                 spawn_cli_reader()
