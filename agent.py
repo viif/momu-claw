@@ -8,6 +8,7 @@
 - 会话持久化: JSONL 保存与恢复
 - 上下文保护: tool_result 截断与历史压缩
 - 多通道输入输出 (CLI + HTTP webhook)
+- 引导加载 / 系统提示词 / 技能 / 记忆 / 混合检索智能
 """
 
 # -------------------------------------------------------------
@@ -15,6 +16,7 @@
 # -------------------------------------------------------------
 import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -57,7 +59,7 @@ SYSTEM_PROMPT = (
 # 工具输出最大字符数 -- 防止超大输出撑爆上下文
 MAX_TOOL_OUTPUT = 50000
 
-# 工作目录 -- 所有文件操作相对于此目录, 防止路径穿越
+# 工作目录
 WORKDIR = Path.cwd()
 WORKSPACE_DIR = WORKDIR / "workspace"
 AGENTS_CONFIG_PATH = WORKDIR / "agents.json"
@@ -75,6 +77,22 @@ HTTP_WEBHOOK_PATH = os.getenv("HTTP_WEBHOOK_PATH", "/webhook")
 DEFAULT_AGENT_ID = "main"
 VALID_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 INVALID_CHARS_RE = re.compile(r"[^a-z0-9_-]+")
+
+# Intelligence 配置
+BOOTSTRAP_FILES = [
+    "SOUL.md",
+    "IDENTITY.md",
+    "TOOLS.md",
+    "USER.md",
+    "HEARTBEAT.md",
+    "BOOTSTRAP.md",
+    "AGENTS.md",
+    "MEMORY.md",
+]
+MAX_FILE_CHARS = 20000
+MAX_TOTAL_CHARS = 150000
+MAX_SKILLS = 150
+MAX_SKILLS_PROMPT = 30000
 
 
 # --------------------------------------------------------------
@@ -113,6 +131,10 @@ def print_warn(text: str) -> None:
 
 def print_session(text: str) -> None:
     print(f"{MAGENTA}{text}{RESET}")
+
+
+def print_section(title: str) -> None:
+    print(f"\n{MAGENTA}{BOLD}--- {title} ---{RESET}")
 
 
 def extract_text(blocks: Sequence[object]) -> str:
@@ -162,6 +184,14 @@ def build_session_key(
     if dm_scope == "per-peer" and pid:
         return f"agent:{aid}:direct:{pid}"
     return f"agent:{aid}:main"
+
+
+def agent_id_from_session_key(session_key: str) -> str:
+    if session_key.startswith("agent:"):
+        parts = session_key.split(":", 2)
+        if len(parts) >= 2 and parts[1]:
+            return normalize_agent_id(parts[1])
+    return DEFAULT_AGENT_ID
 
 
 @dataclass
@@ -248,7 +278,6 @@ class BindingTable:
 class AgentConfig:
     id: str
     name: str
-    system_prompt: str = ""
     model: str = ""
     dm_scope: str = "per-peer"
     workspace_dir: str = ""
@@ -257,9 +286,18 @@ class AgentConfig:
     def effective_model(self) -> str:
         return self.model or MODEL_ID
 
-    @property
-    def effective_system_prompt(self) -> str:
-        return self.system_prompt or SYSTEM_PROMPT
+
+# --------------------------------------------------------------
+# Agent 运行时上下文
+# --------------------------------------------------------------
+@dataclass
+class AgentRuntime:
+    agent_id: str
+    workspace_dir: Path
+    bootstrap_data: dict[str, str]
+    skills_mgr: "SkillsManager"
+    skills_block: str
+    memory_store: "MemoryStore"
 
 
 # -------------------------------------------------------------
@@ -541,6 +579,592 @@ def truncate(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
     return text[:limit] + f"\n... [truncated, {len(text)} total chars]"
 
 
+# --------------------------------------------------------------
+# Bootstrap 文件加载器
+# --------------------------------------------------------------
+# 在 agent 启动时加载工作区的 Bootstrap 文件.
+# 不同加载模式 (full/minimal/none) 适用于不同场景:
+#   full = 主 agent | minimal = 子 agent / cron | none = 最小化
+class BootstrapLoader:
+    def __init__(self, workspace_dir: Path) -> None:
+        self.workspace_dir = workspace_dir
+
+    def load_file(self, name: str) -> str:
+        path = self.workspace_dir / name
+        if not path.is_file():
+            return ""
+        try:
+            return path.read_text(encoding="utf-8")
+        except Exception:
+            return ""
+
+    def truncate_file(self, content: str, max_chars: int = MAX_FILE_CHARS) -> str:
+        """截断超长文件内容. 仅保留头部, 在行边界处截断."""
+        if len(content) <= max_chars:
+            return content
+        cut = content.rfind("\n", 0, max_chars)
+        if cut <= 0:
+            cut = max_chars
+        return (
+            content[:cut]
+            + f"\n\n[... truncated ({len(content)} chars total, showing first {cut}) ...]"
+        )
+
+    def load_all(self, mode: str = "full") -> dict[str, str]:
+        if mode == "none":
+            return {}
+        names = (
+            ["AGENTS.md", "TOOLS.md"] if mode == "minimal" else list(BOOTSTRAP_FILES)
+        )
+        result: dict[str, str] = {}
+        total = 0
+        for name in names:
+            raw = self.load_file(name)
+            if not raw:
+                continue
+            truncated = self.truncate_file(raw)
+            if total + len(truncated) > MAX_TOTAL_CHARS:
+                remaining = MAX_TOTAL_CHARS - total
+                if remaining > 0:
+                    truncated = self.truncate_file(raw, remaining)
+                else:
+                    break
+            result[name] = truncated
+            total += len(truncated)
+        return result
+
+
+# --------------------------------------------------------------
+# 技能发现与注入
+# --------------------------------------------------------------
+# 一个技能 = 一个包含 SKILL.md (带 frontmatter) 的目录.
+# 按优先级顺序扫描; 同名技能会被后发现的覆盖.
+class SkillsManager:
+    def __init__(self, workspace_dir: Path) -> None:
+        self.workspace_dir = workspace_dir
+        self.skills: list[dict[str, str]] = []
+
+    def _parse_frontmatter(self, text: str) -> dict[str, str]:
+        """解析简单的 YAML frontmatter, 不依赖 pyyaml."""
+        meta: dict[str, str] = {}
+        if not text.startswith("---"):
+            return meta
+        parts = text.split("---", 2)
+        if len(parts) < 3:
+            return meta
+        for line in parts[1].strip().splitlines():
+            if ":" not in line:
+                continue
+            key, _, value = line.strip().partition(":")
+            meta[key.strip()] = value.strip()
+        return meta
+
+    def _scan_dir(self, base: Path) -> list[dict[str, str]]:
+        found: list[dict[str, str]] = []
+        if not base.is_dir():
+            return found
+        for child in sorted(base.iterdir()):
+            if not child.is_dir():
+                continue
+            skill_md = child / "SKILL.md"
+            if not skill_md.is_file():
+                continue
+            try:
+                content = skill_md.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            meta = self._parse_frontmatter(content)
+            if not meta.get("name"):
+                continue
+            body = ""
+            if content.startswith("---"):
+                parts = content.split("---", 2)
+                if len(parts) >= 3:
+                    body = parts[2].strip()
+            found.append(
+                {
+                    "name": meta.get("name", ""),
+                    "description": meta.get("description", ""),
+                    "invocation": meta.get("invocation", ""),
+                    "body": body,
+                    "path": str(child),
+                }
+            )
+        return found
+
+    def discover(self, extra_dirs: list[Path] | None = None) -> None:
+        """按优先级扫描技能目录; 同名技能后者覆盖前者."""
+        scan_order: list[Path] = []
+        if extra_dirs:
+            scan_order.extend(extra_dirs)
+        scan_order.append(self.workspace_dir / "skills")
+        scan_order.append(self.workspace_dir / ".skills")
+        scan_order.append(self.workspace_dir / ".agents" / "skills")
+
+        seen: dict[str, dict[str, str]] = {}
+        for directory in scan_order:
+            for skill in self._scan_dir(directory):
+                seen[skill["name"]] = skill
+        self.skills = list(seen.values())[:MAX_SKILLS]
+
+    def format_prompt_block(self) -> str:
+        if not self.skills:
+            return ""
+        lines = ["## Available Skills", ""]
+        total = 0
+        for skill in self.skills:
+            block = (
+                f"### Skill: {skill['name']}\n"
+                f"Description: {skill['description']}\n"
+                f"Invocation: {skill['invocation']}\n"
+            )
+            if skill.get("body"):
+                block += f"\n{skill['body']}\n"
+            block += "\n"
+            if total + len(block) > MAX_SKILLS_PROMPT:
+                lines.append("(... more skills truncated)")
+                break
+            lines.append(block)
+            total += len(block)
+        return "\n".join(lines)
+
+
+# --------------------------------------------------------------
+# 记忆系统
+# --------------------------------------------------------------
+# 两层存储:
+#   MEMORY.md = 长期事实 (手动维护)
+#   daily/{date}.jsonl = 每日日志 (通过 agent 工具自动写入)
+# 搜索: TF-IDF + 余弦相似度, 纯 Python 实现
+class MemoryStore:
+    def __init__(self, workspace_dir: Path) -> None:
+        self.workspace_dir = workspace_dir
+        self.memory_dir = workspace_dir / "memory" / "daily"
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
+
+    def write_memory(self, content: str, category: str = "general") -> str:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        path = self.memory_dir / f"{today}.jsonl"
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "category": category,
+            "content": content,
+        }
+        try:
+            with open(path, "a", encoding="utf-8") as file:
+                file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            return (
+                f"Memory saved to {path.relative_to(self.workspace_dir)} ({category})"
+            )
+        except Exception as exc:
+            return f"Error writing memory: {exc}"
+
+    def load_evergreen(self) -> str:
+        path = self.workspace_dir / "MEMORY.md"
+        if not path.is_file():
+            return ""
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except Exception:
+            return ""
+
+    def _load_all_chunks(self) -> list[dict[str, str]]:
+        """加载所有记忆并拆分为块 (path + text)."""
+        chunks: list[dict[str, str]] = []
+        evergreen = self.load_evergreen()
+        if evergreen:
+            for para in evergreen.split("\n\n"):
+                para = para.strip()
+                if para:
+                    chunks.append({"path": "MEMORY.md", "text": para})
+        if self.memory_dir.is_dir():
+            for jsonl_file in sorted(self.memory_dir.glob("*.jsonl")):
+                try:
+                    for line in jsonl_file.read_text(encoding="utf-8").splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        entry = json.loads(line)
+                        text = entry.get("content", "")
+                        if text:
+                            category = entry.get("category", "")
+                            label = (
+                                f"memory/daily/{jsonl_file.name} [{category}]"
+                                if category
+                                else f"memory/daily/{jsonl_file.name}"
+                            )
+                            chunks.append({"path": label, "text": text})
+                except Exception:
+                    continue
+        return chunks
+
+    @staticmethod
+    def _tokenize(text: str) -> list[str]:
+        """分词: 小写英文 + 单个 CJK 字符, 过滤短 token."""
+        tokens = re.findall(r"[a-z0-9\u4e00-\u9fff]+", text.lower())
+        return [t for t in tokens if len(t) > 1 or "\u4e00" <= t <= "\u9fff"]
+
+    def search_memory(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
+        """TF-IDF + 余弦相似度搜索, 纯 Python 实现."""
+        chunks = self._load_all_chunks()
+        if not chunks:
+            return []
+        query_tokens = self._tokenize(query)
+        if not query_tokens:
+            return []
+
+        chunk_tokens = [self._tokenize(chunk["text"]) for chunk in chunks]
+        df: dict[str, int] = {}
+        for tokens in chunk_tokens:
+            for token in set(tokens):
+                df[token] = df.get(token, 0) + 1
+        count = len(chunks)
+
+        def tfidf(tokens: list[str]) -> dict[str, float]:
+            tf: dict[str, int] = {}
+            for token in tokens:
+                tf[token] = tf.get(token, 0) + 1
+            return {
+                token: freq * (math.log((count + 1) / (df.get(token, 0) + 1)) + 1)
+                for token, freq in tf.items()
+            }
+
+        def cosine(a: dict[str, float], b: dict[str, float]) -> float:
+            common = set(a) & set(b)
+            if not common:
+                return 0.0
+            dot = sum(a[key] * b[key] for key in common)
+            na = math.sqrt(sum(v * v for v in a.values()))
+            nb = math.sqrt(sum(v * v for v in b.values()))
+            return dot / (na * nb) if na and nb else 0.0
+
+        query_vector = tfidf(query_tokens)
+        scored: list[dict[str, Any]] = []
+        for index, tokens in enumerate(chunk_tokens):
+            if not tokens:
+                continue
+            score = cosine(query_vector, tfidf(tokens))
+            if score > 0.0:
+                snippet = chunks[index]["text"]
+                if len(snippet) > 200:
+                    snippet = snippet[:200] + "..."
+                scored.append(
+                    {
+                        "path": chunks[index]["path"],
+                        "score": round(score, 4),
+                        "snippet": snippet,
+                    }
+                )
+        scored.sort(key=lambda item: item["score"], reverse=True)
+        return scored[:top_k]
+
+    # --- Hybrid Memory Search Enhancement ---
+    @staticmethod
+    def _hash_vector(text: str, dim: int = 64) -> list[float]:
+        """使用 hash 投影模拟第二搜索通道, 无需外部向量服务."""
+        tokens = MemoryStore._tokenize(text)
+        vec = [0.0] * dim
+        for token in tokens:
+            hashed = hash(token)
+            for index in range(dim):
+                bit = (hashed >> (index % 62)) & 1
+                vec[index] += 1.0 if bit else -1.0
+        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+        return [v / norm for v in vec]
+
+    @staticmethod
+    def _vector_cosine(a: list[float], b: list[float]) -> float:
+        dot = sum(x * y for x, y in zip(a, b))
+        na = math.sqrt(sum(x * x for x in a))
+        nb = math.sqrt(sum(x * x for x in b))
+        return dot / (na * nb) if na and nb else 0.0
+
+    @staticmethod
+    def _jaccard_similarity(tokens_a: list[str], tokens_b: list[str]) -> float:
+        set_a, set_b = set(tokens_a), set(tokens_b)
+        inter = len(set_a & set_b)
+        union = len(set_a | set_b)
+        return inter / union if union else 0.0
+
+    def _vector_search(
+        self, query: str, chunks: list[dict[str, str]], top_k: int = 10
+    ) -> list[dict[str, Any]]:
+        """按模拟向量相似度检索."""
+        query_vec = self._hash_vector(query)
+        scored = []
+        for chunk in chunks:
+            chunk_vec = self._hash_vector(chunk["text"])
+            score = self._vector_cosine(query_vec, chunk_vec)
+            if score > 0.0:
+                scored.append({"chunk": chunk, "score": score})
+        scored.sort(key=lambda item: item["score"], reverse=True)
+        return scored[:top_k]
+
+    def _keyword_search(
+        self, query: str, chunks: list[dict[str, str]], top_k: int = 10
+    ) -> list[dict[str, Any]]:
+        """复用 TF-IDF 检索作为关键词通道, 返回排序结果."""
+        query_tokens = self._tokenize(query)
+        if not query_tokens:
+            return []
+        chunk_tokens = [self._tokenize(chunk["text"]) for chunk in chunks]
+        count = len(chunks)
+        df: dict[str, int] = {}
+        for tokens in chunk_tokens:
+            for token in set(tokens):
+                df[token] = df.get(token, 0) + 1
+
+        def tfidf(tokens: list[str]) -> dict[str, float]:
+            tf: dict[str, int] = {}
+            for token in tokens:
+                tf[token] = tf.get(token, 0) + 1
+            return {
+                token: freq * (math.log((count + 1) / (df.get(token, 0) + 1)) + 1)
+                for token, freq in tf.items()
+            }
+
+        def cosine(a: dict[str, float], b: dict[str, float]) -> float:
+            common = set(a) & set(b)
+            if not common:
+                return 0.0
+            dot = sum(a[key] * b[key] for key in common)
+            na = math.sqrt(sum(v * v for v in a.values()))
+            nb = math.sqrt(sum(v * v for v in b.values()))
+            return dot / (na * nb) if na and nb else 0.0
+
+        query_vector = tfidf(query_tokens)
+        scored = []
+        for index, tokens in enumerate(chunk_tokens):
+            if not tokens:
+                continue
+            score = cosine(query_vector, tfidf(tokens))
+            if score > 0.0:
+                scored.append({"chunk": chunks[index], "score": score})
+        scored.sort(key=lambda item: item["score"], reverse=True)
+        return scored[:top_k]
+
+    @staticmethod
+    def _merge_hybrid_results(
+        vector_results: list[dict[str, Any]],
+        keyword_results: list[dict[str, Any]],
+        vector_weight: float = 0.7,
+        text_weight: float = 0.3,
+    ) -> list[dict[str, Any]]:
+        """融合向量与关键词结果."""
+        merged: dict[str, dict[str, Any]] = {}
+        for result in vector_results:
+            key = result["chunk"]["text"][:100]
+            merged[key] = {
+                "chunk": result["chunk"],
+                "score": result["score"] * vector_weight,
+            }
+        for result in keyword_results:
+            key = result["chunk"]["text"][:100]
+            if key in merged:
+                merged[key]["score"] += result["score"] * text_weight
+            else:
+                merged[key] = {
+                    "chunk": result["chunk"],
+                    "score": result["score"] * text_weight,
+                }
+        ranked = list(merged.values())
+        ranked.sort(key=lambda item: item["score"], reverse=True)
+        return ranked
+
+    @staticmethod
+    def _temporal_decay(
+        results: list[dict[str, Any]], decay_rate: float = 0.01
+    ) -> list[dict[str, Any]]:
+        """按日期路径施加时间衰减, 新近记忆更靠前."""
+        now = datetime.now(timezone.utc)
+        for result in results:
+            path = result["chunk"].get("path", "")
+            age_days = 0.0
+            date_match = re.search(r"(\d{4}-\d{2}-\d{2})", path)
+            if date_match:
+                try:
+                    chunk_date = datetime.strptime(
+                        date_match.group(1), "%Y-%m-%d"
+                    ).replace(tzinfo=timezone.utc)
+                    age_days = (now - chunk_date).total_seconds() / 86400.0
+                except ValueError:
+                    pass
+            result["score"] *= math.exp(-decay_rate * age_days)
+        return results
+
+    @staticmethod
+    def _mmr_rerank(
+        results: list[dict[str, Any]], lambda_param: float = 0.7
+    ) -> list[dict[str, Any]]:
+        """使用 MMR 去重排, 避免返回过于相似的片段."""
+        if len(results) <= 1:
+            return results
+        tokenized = [MemoryStore._tokenize(r["chunk"]["text"]) for r in results]
+        selected: list[int] = []
+        remaining = list(range(len(results)))
+        reranked: list[dict[str, Any]] = []
+        while remaining:
+            best_idx = -1
+            best_mmr = float("-inf")
+            for idx in remaining:
+                relevance = results[idx]["score"]
+                max_sim = 0.0
+                for sel_idx in selected:
+                    sim = MemoryStore._jaccard_similarity(
+                        tokenized[idx], tokenized[sel_idx]
+                    )
+                    if sim > max_sim:
+                        max_sim = sim
+                mmr = lambda_param * relevance - (1 - lambda_param) * max_sim
+                if mmr > best_mmr:
+                    best_mmr = mmr
+                    best_idx = idx
+            selected.append(best_idx)
+            remaining.remove(best_idx)
+            reranked.append(results[best_idx])
+        return reranked
+
+    def hybrid_search(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
+        """混合检索: keyword -> vector -> merge -> decay -> MMR -> top_k."""
+        chunks = self._load_all_chunks()
+        if not chunks:
+            return []
+        keyword_results = self._keyword_search(query, chunks, top_k=10)
+        vector_results = self._vector_search(query, chunks, top_k=10)
+        merged = self._merge_hybrid_results(vector_results, keyword_results)
+        decayed = self._temporal_decay(merged)
+        reranked = self._mmr_rerank(decayed)
+        results = []
+        for result in reranked[:top_k]:
+            snippet = result["chunk"]["text"]
+            if len(snippet) > 200:
+                snippet = snippet[:200] + "..."
+            results.append(
+                {
+                    "path": result["chunk"]["path"],
+                    "score": round(result["score"], 4),
+                    "snippet": snippet,
+                }
+            )
+        return results
+
+    def get_stats(self) -> dict[str, Any]:
+        evergreen = self.load_evergreen()
+        daily_files = (
+            list(self.memory_dir.glob("*.jsonl")) if self.memory_dir.is_dir() else []
+        )
+        total_entries = 0
+        for daily_file in daily_files:
+            try:
+                total_entries += sum(
+                    1
+                    for line in daily_file.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                )
+            except Exception:
+                pass
+        return {
+            "evergreen_chars": len(evergreen),
+            "daily_files": len(daily_files),
+            "daily_entries": total_entries,
+        }
+
+
+# --------------------------------------------------------------
+# 系统提示词组装 -- 核心函数
+# --------------------------------------------------------------
+# 教学演示 8 个关键提示词层级.
+# 每轮重建 -- 上一轮可能更新了记忆.
+# 模式: full (主 agent) / minimal (子 agent / cron) / none (最小化)
+def build_system_prompt(
+    agent: AgentConfig,
+    runtime: AgentRuntime,
+    *,
+    memory_context: str = "",
+    mode: str = "full",
+    channel: str = "terminal",
+) -> str:
+    bootstrap = runtime.bootstrap_data
+    sections: list[str] = []
+
+    # 第 1 层: 身份 -- 优先 IDENTITY.md, 否则回退到默认值
+    identity = bootstrap.get("IDENTITY.md", "").strip()
+    sections.append(identity if identity else SYSTEM_PROMPT)
+
+    # 第 2 层: 灵魂 -- 人格注入, 越靠前影响力越强
+    if mode == "full":
+        soul = bootstrap.get("SOUL.md", "").strip()
+        if soul:
+            sections.append(f"## Personality\n\n{soul}")
+
+    # 第 3 层: 工具使用指南
+    tools_md = bootstrap.get("TOOLS.md", "").strip()
+    if tools_md:
+        sections.append(f"## Tool Usage Guidelines\n\n{tools_md}")
+
+    # 第 4 层: 技能
+    if mode == "full" and runtime.skills_block:
+        sections.append(runtime.skills_block)
+
+    # 第 5 层: 记忆 -- 长期记忆 + 本轮自动搜索结果
+    if mode == "full":
+        memory_md = bootstrap.get("MEMORY.md", "").strip()
+        memory_parts: list[str] = []
+        if memory_md:
+            memory_parts.append(f"### Evergreen Memory\n\n{memory_md}")
+        if memory_context:
+            memory_parts.append(
+                f"### Recalled Memories (auto-searched)\n\n{memory_context}"
+            )
+        if memory_parts:
+            sections.append("## Memory\n\n" + "\n\n".join(memory_parts))
+        sections.append(
+            "## Memory Instructions\n\n"
+            "- Use memory_write to save important user facts and preferences.\n"
+            "- Reference remembered facts naturally in conversation.\n"
+            "- Use memory_search to recall specific past information."
+        )
+
+    # 第 6 层: Bootstrap 上下文 -- 剩余的 Bootstrap 文件
+    if mode in ("full", "minimal"):
+        for name in ["HEARTBEAT.md", "BOOTSTRAP.md", "AGENTS.md", "USER.md"]:
+            content = bootstrap.get(name, "").strip()
+            if content:
+                sections.append(f"## {name.replace('.md', '')}\n\n{content}")
+
+    # 第 7 层: 运行时上下文
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    sections.append(
+        "## Runtime Context\n\n"
+        f"- Agent ID: {agent.id}\n"
+        f"- Agent Name: {agent.name}\n"
+        f"- Model: {agent.effective_model}\n"
+        f"- Channel: {channel}\n"
+        f"- Workspace: {runtime.workspace_dir}\n"
+        f"- Current time: {now}\n"
+        f"- Prompt mode: {mode}"
+    )
+
+    # 第 8 层: 渠道提示
+    hints = {
+        "cli": "You are responding via a terminal REPL. Markdown is supported.",
+        "http": "You are responding via an HTTP webhook bridge. Keep replies concise.",
+    }
+    sections.append(
+        f"## Channel\n\n{hints.get(channel, f'You are responding via {channel}.')}"
+    )
+
+    return "\n\n".join(sections)
+
+
+def _auto_recall(runtime: AgentRuntime, user_message: str) -> str:
+    """根据用户消息自动搜索相关记忆, 注入到系统提示词中."""
+    results = runtime.memory_store.hybrid_search(user_message, top_k=3)
+    if not results:
+        return ""
+    return "\n".join(f"- [{r['path']}] {r['snippet']}" for r in results)
+
+
 # -------------------------------------------------------------
 # 工具实现
 # -------------------------------------------------------------
@@ -646,6 +1270,30 @@ def tool_get_current_time() -> str:
     return now.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def tool_memory_write(
+    runtime: AgentRuntime | None, content: str, category: str = "general"
+) -> str:
+    if runtime is None:
+        return "Error: No active agent runtime for memory_write"
+    print_tool(
+        "memory_write", f"agent={runtime.agent_id} [{category}] {content[:60]}..."
+    )
+    return runtime.memory_store.write_memory(content, category)
+
+
+def tool_memory_search(runtime: AgentRuntime | None, query: str, top_k: int = 5) -> str:
+    if runtime is None:
+        return "Error: No active agent runtime for memory_search"
+    print_tool("memory_search", f"agent={runtime.agent_id} {query}")
+    results = runtime.memory_store.hybrid_search(query, top_k)
+    if not results:
+        return "No relevant memories found."
+    return "\n".join(
+        f"[{result['path']}] (score: {result['score']}) {result['snippet']}"
+        for result in results
+    )
+
+
 # -------------------------------------------------------------
 # 工具定义: Schema (传给 API) + Handler 调度表
 # -------------------------------------------------------------
@@ -741,6 +1389,42 @@ TOOLS: list[ToolParam] = [
             "required": [],
         },
     },
+    {
+        "name": "memory_write",
+        "description": (
+            "Save an important fact or observation to long-term memory. "
+            "Use when you learn something worth remembering about the user or context."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "The fact or observation to remember.",
+                },
+                "category": {
+                    "type": "string",
+                    "description": "Category: preference, fact, context, etc.",
+                },
+            },
+            "required": ["content"],
+        },
+    },
+    {
+        "name": "memory_search",
+        "description": "Search stored memories for relevant information, ranked by similarity.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query."},
+                "top_k": {
+                    "type": "integer",
+                    "description": "Max results. Default: 5.",
+                },
+            },
+            "required": ["query"],
+        },
+    },
 ]
 
 TOOL_HANDLERS: dict[str, Any] = {
@@ -751,8 +1435,30 @@ TOOL_HANDLERS: dict[str, Any] = {
     "get_current_time": tool_get_current_time,
 }
 
+MEMORY_TOOL_NAMES = {"memory_write", "memory_search"}
 
-def process_tool_call(tool_name: str, tool_input: dict[str, Any]) -> str:
+
+def process_tool_call(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    runtime: AgentRuntime | None = None,
+) -> str:
+    if tool_name == "memory_write":
+        try:
+            return tool_memory_write(runtime, **tool_input)
+        except TypeError as exc:
+            return f"Error: Invalid arguments for {tool_name}: {exc}"
+        except Exception as exc:
+            return f"Error: {tool_name} failed: {exc}"
+
+    if tool_name == "memory_search":
+        try:
+            return tool_memory_search(runtime, **tool_input)
+        except TypeError as exc:
+            return f"Error: Invalid arguments for {tool_name}: {exc}"
+        except Exception as exc:
+            return f"Error: {tool_name} failed: {exc}"
+
     handler = TOOL_HANDLERS.get(tool_name)
     if handler is None:
         return f"Error: Unknown tool '{tool_name}'"
@@ -991,6 +1697,7 @@ class AgentManager:
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self._agents: dict[str, AgentConfig] = {}
         self._sessions: dict[str, list[dict[str, Any]]] = {}
+        self._runtimes: dict[str, AgentRuntime] = {}
         self.cli_focus_session_key: str | None = None
         self.cli_forced_agent_id: str = ""
 
@@ -1005,12 +1712,24 @@ class AgentManager:
         normalized = AgentConfig(
             id=aid,
             name=config.name or aid,
-            system_prompt=config.system_prompt,
             model=config.model,
             dm_scope=config.dm_scope or "per-peer",
             workspace_dir=str(workspace_dir),
         )
         self._agents[aid] = normalized
+        loader = BootstrapLoader(workspace_dir)
+        bootstrap_data = loader.load_all(mode="full")
+        skills_mgr = SkillsManager(workspace_dir)
+        skills_mgr.discover()
+        memory_store = MemoryStore(workspace_dir)
+        self._runtimes[aid] = AgentRuntime(
+            agent_id=aid,
+            workspace_dir=workspace_dir,
+            bootstrap_data=bootstrap_data,
+            skills_mgr=skills_mgr,
+            skills_block=skills_mgr.format_prompt_block(),
+            memory_store=memory_store,
+        )
         return normalized
 
     def get_agent(self, agent_id: str) -> AgentConfig | None:
@@ -1018,6 +1737,9 @@ class AgentManager:
 
     def list_agents(self) -> list[AgentConfig]:
         return list(self._agents.values())
+
+    def get_runtime(self, agent_id: str) -> AgentRuntime | None:
+        return self._runtimes.get(normalize_agent_id(agent_id))
 
     def get_session(
         self, session_key: str, store: SessionStore
@@ -1039,7 +1761,6 @@ def load_agents_config() -> list[AgentConfig]:
             AgentConfig(
                 id=DEFAULT_AGENT_ID,
                 name="Main",
-                system_prompt=SYSTEM_PROMPT,
                 model=MODEL_ID,
                 dm_scope="per-account-channel-peer",
             )
@@ -1048,12 +1769,13 @@ def load_agents_config() -> list[AgentConfig]:
     try:
         raw = json.loads(AGENTS_CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        print_warn(f"  agents.json 读取失败，回退默认 agent: {exc}")
+        print_warn(
+            f"  Failed to read agents.json, falling back to default agent: {exc}"
+        )
         return [
             AgentConfig(
                 id=DEFAULT_AGENT_ID,
                 name="Main",
-                system_prompt=SYSTEM_PROMPT,
                 model=MODEL_ID,
                 dm_scope="per-account-channel-peer",
             )
@@ -1073,7 +1795,6 @@ def load_agents_config() -> list[AgentConfig]:
             AgentConfig(
                 id=str(item.get("id") or DEFAULT_AGENT_ID),
                 name=str(item.get("name") or item.get("id") or DEFAULT_AGENT_ID),
-                system_prompt=str(item.get("system_prompt") or SYSTEM_PROMPT),
                 model=str(item.get("model") or ""),
                 dm_scope=str(item.get("dm_scope") or "per-account-channel-peer"),
                 workspace_dir=str(item.get("workspace_dir") or ""),
@@ -1085,7 +1806,6 @@ def load_agents_config() -> list[AgentConfig]:
             AgentConfig(
                 id=DEFAULT_AGENT_ID,
                 name="Main",
-                system_prompt=SYSTEM_PROMPT,
                 model=MODEL_ID,
                 dm_scope="per-account-channel-peer",
             )
@@ -1372,7 +2092,7 @@ def cmd_bindings(bindings: BindingTable) -> None:
 def cmd_route(bindings: BindingTable, agents: AgentManager, args: str) -> None:
     parts = args.strip().split()
     if len(parts) < 2:
-        print_warn("  用法: /route <channel> <peer_id> [account_id] [guild_id]")
+        print_warn("  Usage: /route <channel> <peer_id> [account_id] [guild_id]")
         return
     inbound = InboundMessage(
         text="",
@@ -1401,9 +2121,19 @@ def cmd_agents(agent_mgr: AgentManager) -> None:
         return
     print_info(f"  Agents ({len(agents)}):")
     for agent in agents:
+        runtime = agent_mgr.get_runtime(agent.id)
+        memory_stats = runtime.memory_store.get_stats() if runtime else {}
+        bootstrap_count = len(runtime.bootstrap_data) if runtime else 0
+        skills_count = len(runtime.skills_mgr.skills) if runtime else 0
         print_info(
             f"    {agent.id} ({agent.name}) model={agent.effective_model} "
             f"dm_scope={agent.dm_scope} workspace={agent.workspace_dir}"
+        )
+        print_info(
+            f"      bootstrap={bootstrap_count} skills={skills_count} "
+            f"memory={memory_stats.get('evergreen_chars', 0)}c/"
+            f"{memory_stats.get('daily_files', 0)}f/"
+            f"{memory_stats.get('daily_entries', 0)}e"
         )
 
 
@@ -1412,7 +2142,7 @@ def cmd_sessions(
 ) -> None:
     sessions = store.list_sessions(agent_id)
     if not sessions:
-        print_info("  没有会话记录.")
+        print_info("  No session records.")
         return
     print_info(f"  Sessions ({len(sessions)}):")
     for session_key, meta in sessions:
@@ -1425,6 +2155,16 @@ def cmd_sessions(
         print_info(
             f"    {session_key}{label_str}  agent={aid} msgs={count} last={last}{active}"
         )
+
+
+def current_cli_runtime(agent_mgr: AgentManager) -> AgentRuntime | None:
+    if agent_mgr.cli_forced_agent_id:
+        return agent_mgr.get_runtime(agent_mgr.cli_forced_agent_id)
+    if agent_mgr.cli_focus_session_key:
+        return agent_mgr.get_runtime(
+            agent_id_from_session_key(agent_mgr.cli_focus_session_key)
+        )
+    return agent_mgr.get_runtime(DEFAULT_AGENT_ID)
 
 
 def handle_repl_command(
@@ -1445,13 +2185,13 @@ def handle_repl_command(
         if not target_agent_id:
             focus_key = agent_mgr.cli_focus_session_key or ""
             if focus_key.startswith("agent:"):
-                parts = focus_key.split(":", 2)
-                if len(parts) >= 2 and parts[1]:
-                    target_agent_id = parts[1]
+                key_parts = focus_key.split(":", 2)
+                if len(key_parts) >= 2 and key_parts[1]:
+                    target_agent_id = key_parts[1]
         target_agent_id = normalize_agent_id(target_agent_id or DEFAULT_AGENT_ID)
         agent = agent_mgr.get_agent(target_agent_id)
         if agent is None:
-            print_warn(f"  未找到 agent: {target_agent_id}")
+            print_warn(f"  Agent not found: {target_agent_id}")
             return True, messages, None
 
         new_session_key = build_session_key(
@@ -1472,7 +2212,8 @@ def handle_repl_command(
         agent_mgr.set_cli_focus(new_session_key)
         store.current_session_key = new_session_key
         print_session(
-            f"  重置当前 CLI 会话: {new_session_key}" + (f" ({arg})" if arg else "")
+            f"  Reset current CLI session: {new_session_key}"
+            + (f" ({arg})" if arg else "")
         )
         return True, [], new_session_key
 
@@ -1482,21 +2223,23 @@ def handle_repl_command(
 
     if cmd == "/switch":
         if not arg:
-            print_warn("  用法: /switch <session_key前缀>")
+            print_warn("  Usage: /switch <session_key_prefix>")
             return True, messages, None
         target = arg.strip()
         matched = [key for key in store._index if key.startswith(target)]
         if len(matched) == 0:
-            print_warn(f"  未找到会话: {target}")
+            print_warn(f"  Session not found: {target}")
             return True, messages, None
         if len(matched) > 1:
-            print_warn(f"  前缀不唯一，匹配到: {', '.join(matched)}")
+            print_warn(f"  Prefix is not unique, matched: {', '.join(matched)}")
             return True, messages, None
         session_key = matched[0]
         new_messages = store.load_session(session_key)
         agent_mgr.set_cli_focus(session_key)
         store.current_session_key = session_key
-        print_session(f"  切换到会话: {session_key} ({len(new_messages)} messages)")
+        print_session(
+            f"  Switched to session: {session_key} ({len(new_messages)} messages)"
+        )
         return True, new_messages, session_key
 
     if cmd == "/context":
@@ -1513,9 +2256,9 @@ def handle_repl_command(
 
     if cmd == "/compact":
         if len(messages) <= 4:
-            print_info("  消息太少，暂不需要压缩 (需 > 4).")
+            print_info("  Too few messages to compact yet (need > 4).")
             return True, messages, None
-        print_session("  正在压缩历史...")
+        print_session("  Compacting history...")
         new_messages = guard.compact_history(messages, client, MODEL_ID)
         print_session(f"  {len(messages)} -> {len(new_messages)} messages")
         return True, new_messages, None
@@ -1585,7 +2328,96 @@ def handle_repl_command(
             agent_mgr.set_cli_forced_agent(aid)
             print_info(f"  Forcing CLI agent: {aid}")
         else:
-            print_warn(f"  未找到 agent: {aid}")
+            print_warn(f"  Agent not found: {aid}")
+        return True, messages, None
+
+    runtime = current_cli_runtime(agent_mgr)
+
+    if cmd == "/soul":
+        print_section("SOUL.md")
+        soul = runtime.bootstrap_data.get("SOUL.md", "") if runtime else ""
+        print(soul if soul else f"{DIM}(SOUL.md not found){RESET}")
+        return True, messages, None
+
+    if cmd == "/skills":
+        print_section("Discovered Skills")
+        skills = runtime.skills_mgr.skills if runtime else []
+        if not skills:
+            print(f"{DIM}(No skills found){RESET}")
+        else:
+            for skill in skills:
+                print(
+                    f"  {BLUE}{skill['invocation'] or '(manual)'}{RESET}  "
+                    f"{skill['name']} - {skill['description']}"
+                )
+                print(f"    {DIM}path: {skill['path']}{RESET}")
+        return True, messages, None
+
+    if cmd == "/memory":
+        print_section("Memory Stats")
+        if runtime is None:
+            print(f"{DIM}(No current agent runtime){RESET}")
+            return True, messages, None
+        stats = runtime.memory_store.get_stats()
+        print(f"  Agent: {runtime.agent_id}")
+        print(f"  Evergreen memory (MEMORY.md): {stats['evergreen_chars']} chars")
+        print(f"  Daily files: {stats['daily_files']}")
+        print(f"  Daily entries: {stats['daily_entries']}")
+        return True, messages, None
+
+    if cmd == "/search":
+        if not arg:
+            print_warn("  Usage: /search <query>")
+            return True, messages, None
+        print_section(f"Memory Search: {arg}")
+        if runtime is None:
+            print(f"{DIM}(No current agent runtime){RESET}")
+            return True, messages, None
+        results = runtime.memory_store.hybrid_search(arg)
+        if not results:
+            print(f"{DIM}(No results){RESET}")
+        else:
+            for result in results:
+                color = GREEN if result["score"] > 0.3 else DIM
+                print(f"  {color}[{result['score']:.4f}]{RESET} {result['path']}")
+                print(f"    {result['snippet']}")
+        return True, messages, None
+
+    if cmd == "/prompt":
+        print_section("Full System Prompt")
+        if runtime is None:
+            print(f"{DIM}(No current agent runtime){RESET}")
+            return True, messages, None
+        focus_key = agent_mgr.cli_focus_session_key or ""
+        channel_name = "cli"
+        prompt = build_system_prompt(
+            agent_mgr.get_agent(runtime.agent_id)
+            or AgentConfig(runtime.agent_id, runtime.agent_id),
+            runtime,
+            memory_context=_auto_recall(runtime, "show prompt"),
+            channel=channel_name if focus_key else "terminal",
+        )
+        if len(prompt) > 3000:
+            print(prompt[:3000])
+            print(
+                f"\n{DIM}... ({len(prompt) - 3000} more chars, total {len(prompt)}){RESET}"
+            )
+        else:
+            print(prompt)
+        print(f"\n{DIM}Total prompt length: {len(prompt)} chars{RESET}")
+        return True, messages, None
+
+    if cmd == "/bootstrap":
+        print_section("Bootstrap Files")
+        if runtime is None or not runtime.bootstrap_data:
+            print(f"{DIM}(No Bootstrap files loaded){RESET}")
+        else:
+            for name, content in runtime.bootstrap_data.items():
+                print(f"  {BLUE}{name}{RESET}: {len(content)} chars")
+        total = sum(
+            len(value) for value in (runtime.bootstrap_data.values() if runtime else [])
+        )
+        print(f"\n  {DIM}Total: {total} chars (limit: {MAX_TOTAL_CHARS}){RESET}")
         return True, messages, None
 
     if cmd == "/help":
@@ -1602,6 +2434,12 @@ def handle_repl_command(
         print_info("    /route ...         Preview route resolution")
         print_info("    /sessions [agent]  List sessions")
         print_info("    /agent <id|off>    Force CLI agent")
+        print_info("    /soul              Show current agent SOUL.md")
+        print_info("    /skills            List current agent skills")
+        print_info("    /memory            Show current agent memory stats")
+        print_info("    /search <query>    Search current agent memory")
+        print_info("    /prompt            Show current agent system prompt")
+        print_info("    /bootstrap         Show current agent bootstrap files")
         print_info("    /help              Show this help")
         print_info("    quit / exit        Exit the REPL")
         return True, messages, None
@@ -1615,6 +2453,7 @@ def handle_repl_command(
 def run_agent_session_turn(
     inbound: InboundMessage,
     agent: AgentConfig,
+    runtime: AgentRuntime,
     session_key: str,
     messages: list[dict[str, Any]],
     store: SessionStore,
@@ -1625,11 +2464,21 @@ def run_agent_session_turn(
     store.save_turn(session_key, "user", inbound.text)
 
     while True:
+        memory_context = _auto_recall(runtime, inbound.text)
+        if memory_context:
+            print_info(f"  [memory] auto recall hit for agent:{runtime.agent_id}")
+        system_prompt = build_system_prompt(
+            agent,
+            runtime,
+            memory_context=memory_context,
+            channel=inbound.channel or "terminal",
+        )
+
         try:
             response = guard.guard_api_call(
                 api_client=client,
                 model=agent.effective_model,
-                system=agent.effective_system_prompt,
+                system=system_prompt,
                 messages=messages,
                 tools=TOOLS,
             )
@@ -1674,7 +2523,11 @@ def run_agent_session_turn(
                     continue
 
                 tool_use_block = cast(Any, block)
-                result = process_tool_call(tool_use_block.name, tool_use_block.input)
+                result = process_tool_call(
+                    tool_use_block.name,
+                    tool_use_block.input,
+                    runtime=runtime,
+                )
                 store.save_tool_result(
                     session_key,
                     tool_use_block.id,
@@ -1735,8 +2588,12 @@ def dispatch_inbound(
 
     agent_id, session_key, matched = resolve_route(bindings, agent_mgr, inbound)
     agent = agent_mgr.get_agent(agent_id)
+    runtime = agent_mgr.get_runtime(agent_id)
     if agent is None:
-        print_warn(f"  未找到 agent: {agent_id}")
+        print_warn(f"  Agent not found: {agent_id}")
+        return
+    if runtime is None:
+        print_warn(f"  Agent runtime not found: {agent_id}")
         return
 
     store.ensure_session(
@@ -1759,7 +2616,16 @@ def dispatch_inbound(
         f"  [session] agent={agent_id} workspace={agent.workspace_dir} key={session_key}"
     )
 
-    run_agent_session_turn(inbound, agent, session_key, messages, store, guard, mgr)
+    run_agent_session_turn(
+        inbound,
+        agent,
+        runtime,
+        session_key,
+        messages,
+        store,
+        guard,
+        mgr,
+    )
 
 
 # -------------------------------------------------------------
@@ -1779,7 +2645,6 @@ def agent_loop() -> None:
             AgentConfig(
                 id=DEFAULT_AGENT_ID,
                 name="Main",
-                system_prompt=SYSTEM_PROMPT,
                 model=MODEL_ID,
                 dm_scope="per-account-channel-peer",
             )
@@ -1844,7 +2709,7 @@ def agent_loop() -> None:
     )
     cli_messages = agent_mgr.get_session(cli_session_key, store)
     agent_mgr.set_cli_focus(cli_session_key)
-    print_session(f"  CLI 会话: {cli_session_key} ({len(cli_messages)} messages)")
+    print_session(f"  CLI session: {cli_session_key} ({len(cli_messages)} messages)")
 
     print_info("=" * 60)
     print_info(f"  Model: {MODEL_ID}")
@@ -1852,14 +2717,31 @@ def agent_loop() -> None:
     print_info(f"  Agents config: {AGENTS_CONFIG_PATH.name}")
     print_info(f"  Agents loaded: {len(agent_mgr.list_agents())}")
     for agent in agent_mgr.list_agents():
+        runtime = agent_mgr.get_runtime(agent.id)
+        stats = (
+            runtime.memory_store.get_stats()
+            if runtime
+            else {
+                "evergreen_chars": 0,
+                "daily_files": 0,
+                "daily_entries": 0,
+            }
+        )
         print_info(f"    - {agent.id}: workspace={agent.workspace_dir}")
+        print_info(
+            f"      bootstrap={len(runtime.bootstrap_data) if runtime else 0} "
+            f"skills={len(runtime.skills_mgr.skills) if runtime else 0} "
+            f"memory={stats['evergreen_chars']}c/{stats['daily_files']}f/{stats['daily_entries']}e"
+        )
     print_info(f"  Bindings: {len(bindings.list_all())}")
-    print_info(f"  Tools: {', '.join(TOOL_HANDLERS.keys())}")
+    print_info(
+        f"  Tools: {', '.join(list(TOOL_HANDLERS.keys()) + sorted(MEMORY_TOOL_NAMES))}"
+    )
     print_info(f"  Channels: {', '.join(mgr.list_channels())}")
     print_info(
         f"  HTTP Webhook: http://{HTTP_WEBHOOK_HOST}:{HTTP_WEBHOOK_PORT}{HTTP_WEBHOOK_PATH}"
     )
-    print_info("  输入 /help 查看命令, 输入 quit 或 exit 退出.")
+    print_info("  Enter /help to view commands, or quit / exit to leave.")
     print_info("=" * 60)
     print()
 
@@ -1875,12 +2757,12 @@ def agent_loop() -> None:
                     continue
 
             if inbound is None:
-                print(f"\n{DIM}再见.{RESET}")
+                print(f"\n{DIM}Goodbye.{RESET}")
                 break
 
             user_input = inbound.text
             if inbound.channel == "cli" and user_input.lower() in ("quit", "exit"):
-                print(f"{DIM}再见.{RESET}")
+                print(f"{DIM}Goodbye.{RESET}")
                 break
 
             if inbound.channel == "cli" and user_input.startswith("/"):
@@ -1916,8 +2798,8 @@ def agent_loop() -> None:
 # -------------------------------------------------------------
 def main() -> None:
     if not os.getenv("ANTHROPIC_API_KEY"):
-        print(f"{YELLOW}Error: ANTHROPIC_API_KEY 未设置.{RESET}")
-        print(f"{DIM}将 .env.example 复制为 .env 并填入你的 key.{RESET}")
+        print(f"{YELLOW}Error: ANTHROPIC_API_KEY is not set.{RESET}")
+        print(f"{DIM}Copy .env.example to .env and fill in your key.{RESET}")
         sys.exit(1)
 
     agent_loop()
