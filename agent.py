@@ -1082,7 +1082,7 @@ def build_system_prompt(
     *,
     memory_context: str = "",
     mode: str = "full",
-    channel: str = "terminal",
+    channel: str = "cli",
 ) -> str:
     bootstrap = runtime.bootstrap_data
     sections: list[str] = []
@@ -1147,7 +1147,7 @@ def build_system_prompt(
 
     # 第 8 层: 渠道提示
     hints = {
-        "cli": "You are responding via a terminal REPL. Markdown is supported.",
+        "cli": "You are responding via a CLI REPL. Markdown is supported.",
         "http": "You are responding via an HTTP webhook bridge. Keep replies concise.",
     }
     sections.append(
@@ -2395,7 +2395,7 @@ def handle_repl_command(
             or AgentConfig(runtime.agent_id, runtime.agent_id),
             runtime,
             memory_context=_auto_recall(runtime, "show prompt"),
-            channel=channel_name if focus_key else "terminal",
+            channel=channel_name if focus_key else "cli",
         )
         if len(prompt) > 3000:
             print(prompt[:3000])
@@ -2471,7 +2471,7 @@ def run_agent_session_turn(
             agent,
             runtime,
             memory_context=memory_context,
-            channel=inbound.channel or "terminal",
+            channel=inbound.channel or "cli",
         )
 
         try:
