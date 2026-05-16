@@ -17,6 +17,7 @@
 # -------------------------------------------------------------
 import hashlib
 import json
+import locale
 import math
 import os
 import queue
@@ -1766,6 +1767,12 @@ def tool_bash(
     print_tool("bash", command)
     try:
         cwd = runtime.workspace_dir if runtime is not None else WORKDIR
+        preferred_encoding = locale.getpreferredencoding(False) or "utf-8"
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        env.setdefault("LANG", "C.UTF-8")
+        env.setdefault("LC_ALL", "C.UTF-8")
         result = subprocess.run(
             command,
             shell=True,
@@ -1773,6 +1780,9 @@ def tool_bash(
             text=True,
             timeout=timeout,
             cwd=str(cwd),
+            encoding=preferred_encoding,
+            errors="replace",
+            env=env,
         )
         output = ""
         if result.stdout:
