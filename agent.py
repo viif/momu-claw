@@ -9,6 +9,7 @@
 - 上下文保护: tool_result 截断与历史压缩
 - 多通道输入输出 (CLI + HTTP webhook)
 - 引导加载 / 系统提示词 / 技能 / 记忆 / 混合检索智能
+- heartbeat 后台巡检 / cron 定时任务 / 线程协作
 """
 
 # -------------------------------------------------------------
@@ -35,6 +36,7 @@ from typing import Any, cast
 from anthropic import Anthropic
 from anthropic.types import ToolParam
 from anthropic.types.text_block import TextBlock
+from croniter import croniter
 from dotenv import load_dotenv
 
 
@@ -93,6 +95,13 @@ MAX_FILE_CHARS = 20000
 MAX_TOTAL_CHARS = 150000
 MAX_SKILLS = 150
 MAX_SKILLS_PROMPT = 30000
+HEARTBEAT_INTERVAL_SECONDS = 300
+HEARTBEAT_REFRESH_SECONDS = 1800
+HEARTBEAT_ACTIVE_HOURS = (7, 23)
+CRON_POLL_SECONDS = 1.0
+CRON_FILE_NAME = "CRON.json"
+CRON_RUN_LOG_NAME = "cron-runs.jsonl"
+CRON_AUTO_DISABLE_THRESHOLD = 3
 
 
 # --------------------------------------------------------------
@@ -298,6 +307,10 @@ class AgentRuntime:
     skills_mgr: "SkillsManager"
     skills_index_block: str
     memory_store: "MemoryStore"
+    lane_lock: threading.Lock | None = None
+    heartbeat_runner: "HeartbeatRunner | None" = None
+    cron_service: "CronService | None" = None
+    cron_thread: threading.Thread | None = None
 
 
 # -------------------------------------------------------------
@@ -1228,6 +1241,468 @@ def _collect_loaded_skills(messages: list[dict[str, Any]]) -> list[str]:
     return loaded
 
 
+# --------------------------------------------------------------
+# CronJob + CronService
+# --------------------------------------------------------------
+# 调度类型: at (一次性) | every (固定间隔) | cron (5 字段表达式)
+# 连续错误超过阈值后自动禁用. 运行日志 -> cron-runs.jsonl
+@dataclass
+class CronJob:
+    id: str
+    name: str
+    enabled: bool
+    schedule_kind: str
+    schedule_config: dict[str, Any]
+    payload: dict[str, Any]
+    delete_after_run: bool = False
+    consecutive_errors: int = 0
+    last_run_at: float = 0.0
+    next_run_at: float = 0.0
+
+
+class CronService:
+    def __init__(
+        self,
+        agent: AgentConfig,
+        runtime: AgentRuntime,
+        guard: "ContextGuard",
+    ) -> None:
+        self.agent = agent
+        self.runtime = runtime
+        self.guard = guard
+        self.cron_file = runtime.workspace_dir / CRON_FILE_NAME
+        self.jobs: list[CronJob] = []
+        self._output_queue: list[str] = []
+        self._queue_lock = threading.Lock()
+        self._run_log = runtime.workspace_dir / CRON_RUN_LOG_NAME
+        self.load_jobs()
+
+    def load_jobs(self) -> None:
+        self.jobs.clear()
+        if not self.cron_file.is_file():
+            return
+        try:
+            raw = json.loads(self.cron_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            print_warn(f"  Failed to load CRON.json for {self.agent.id}: {exc}")
+            return
+        jobs = raw.get("jobs", []) if isinstance(raw, dict) else []
+        now = time.time()
+        for record in jobs:
+            if not isinstance(record, dict):
+                continue
+            sched = record.get("schedule", {})
+            if not isinstance(sched, dict):
+                continue
+            kind = str(sched.get("kind", ""))
+            if kind not in ("at", "every", "cron"):
+                continue
+            job = CronJob(
+                id=str(record.get("id", "")),
+                name=str(record.get("name", "")) or str(record.get("id", "")),
+                enabled=bool(record.get("enabled", True)),
+                schedule_kind=kind,
+                schedule_config=sched,
+                payload=record.get("payload", {})
+                if isinstance(record.get("payload", {}), dict)
+                else {},
+                delete_after_run=bool(record.get("delete_after_run", False)),
+            )
+            job.next_run_at = self._compute_next(job, now)
+            self.jobs.append(job)
+
+    def _compute_next(self, job: CronJob, now: float) -> float:
+        """计算下次运行时间戳. 如果没有后续调度则返回 0.0."""
+        cfg = job.schedule_config
+        if job.schedule_kind == "at":
+            try:
+                ts = datetime.fromisoformat(str(cfg.get("at", ""))).timestamp()
+                return ts if ts > now else 0.0
+            except (ValueError, OSError, TypeError):
+                return 0.0
+        if job.schedule_kind == "every":
+            try:
+                every = max(1, int(cfg.get("every_seconds", 3600)))
+            except (TypeError, ValueError):
+                return 0.0
+            try:
+                anchor = datetime.fromisoformat(str(cfg.get("anchor", ""))).timestamp()
+            except (ValueError, OSError, TypeError):
+                anchor = now
+            if now < anchor:
+                return anchor
+            steps = int((now - anchor) / every) + 1
+            return anchor + steps * every
+        if job.schedule_kind == "cron":
+            expr = str(cfg.get("expr", "")).strip()
+            if not expr:
+                return 0.0
+            try:
+                return (
+                    croniter(expr, datetime.fromtimestamp(now))
+                    .get_next(datetime)
+                    .timestamp()
+                )
+            except (ValueError, KeyError):
+                return 0.0
+        return 0.0
+
+    def tick(self) -> None:
+        """每秒调用一次; 检查并执行到期的任务."""
+        now = time.time()
+        remove_ids: list[str] = []
+        for job in self.jobs:
+            if not job.enabled or job.next_run_at <= 0 or now < job.next_run_at:
+                continue
+            self._run_job(job, now)
+            if job.delete_after_run and job.schedule_kind == "at":
+                remove_ids.append(job.id)
+        if remove_ids:
+            self.jobs = [job for job in self.jobs if job.id not in remove_ids]
+
+    def _run_job(self, job: CronJob, now: float) -> None:
+        payload = job.payload
+        kind = str(payload.get("kind", ""))
+        output = ""
+        status = "ok"
+        error = ""
+        lane_lock = self.runtime.lane_lock
+        if lane_lock is None:
+            return
+        acquired = lane_lock.acquire(blocking=False)
+        if not acquired:
+            return
+        try:
+            if kind == "agent_turn":
+                message = str(payload.get("message", "")).strip()
+                if not message:
+                    output, status = "[empty message]", "skipped"
+                else:
+                    output = run_background_single_turn(
+                        self.agent,
+                        self.runtime,
+                        self.guard,
+                        message,
+                        extra_context=(
+                            "You are performing a scheduled cron task. "
+                            "Be concise and produce only the task result."
+                        ),
+                        channel="cron",
+                    )
+            elif kind == "system_event":
+                output = str(payload.get("text", "")).strip()
+                if not output:
+                    status = "skipped"
+            else:
+                output, status, error = (
+                    f"[unknown kind: {kind}]",
+                    "error",
+                    f"unknown kind: {kind}",
+                )
+        except Exception as exc:
+            status, error, output = "error", str(exc), f"[cron error: {exc}]"
+        finally:
+            lane_lock.release()
+
+        job.last_run_at = now
+        if status == "error":
+            job.consecutive_errors += 1
+            if job.consecutive_errors >= CRON_AUTO_DISABLE_THRESHOLD:
+                job.enabled = False
+                output = (
+                    f"Job '{job.name}' auto-disabled after "
+                    f"{job.consecutive_errors} consecutive errors: {error}"
+                )
+        else:
+            job.consecutive_errors = 0
+        job.next_run_at = self._compute_next(job, now)
+        self._append_log(job, now, status, output, error)
+        if output and status != "skipped":
+            with self._queue_lock:
+                self._output_queue.append(f"[cron:{self.agent.id}/{job.name}] {output}")
+
+    def _append_log(
+        self, job: CronJob, now: float, status: str, output: str, error: str
+    ) -> None:
+        entry = {
+            "job_id": job.id,
+            "run_at": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+            "status": status,
+            "output_preview": output[:200],
+        }
+        if error:
+            entry["error"] = error
+        try:
+            with open(self._run_log, "a", encoding="utf-8") as file:
+                file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
+    def trigger_job(self, job_id: str) -> str:
+        for job in self.jobs:
+            if job.id == job_id:
+                self._run_job(job, time.time())
+                return f"'{job.name}' triggered (errors={job.consecutive_errors})"
+        return f"Job '{job_id}' not found"
+
+    def drain_output(self) -> list[str]:
+        with self._queue_lock:
+            items = list(self._output_queue)
+            self._output_queue.clear()
+            return items
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        now = time.time()
+        rows: list[dict[str, Any]] = []
+        for job in self.jobs:
+            next_in = max(0.0, job.next_run_at - now) if job.next_run_at > 0 else None
+            rows.append(
+                {
+                    "id": job.id,
+                    "name": job.name,
+                    "enabled": job.enabled,
+                    "kind": job.schedule_kind,
+                    "errors": job.consecutive_errors,
+                    "last_run": (
+                        datetime.fromtimestamp(job.last_run_at).isoformat()
+                        if job.last_run_at > 0
+                        else "never"
+                    ),
+                    "next_run": (
+                        datetime.fromtimestamp(job.next_run_at).isoformat()
+                        if job.next_run_at > 0
+                        else "n/a"
+                    ),
+                    "next_in": round(next_in) if next_in is not None else None,
+                }
+            )
+        return rows
+
+
+# --------------------------------------------------------------
+# HeartbeatRunner
+# --------------------------------------------------------------
+class HeartbeatRunner:
+    def __init__(
+        self,
+        agent: AgentConfig,
+        runtime: AgentRuntime,
+        guard: "ContextGuard",
+        *,
+        interval_seconds: int = HEARTBEAT_INTERVAL_SECONDS,
+        active_hours: tuple[int, int] = HEARTBEAT_ACTIVE_HOURS,
+    ) -> None:
+        self.agent = agent
+        self.runtime = runtime
+        self.guard = guard
+        self.interval_seconds = max(1, interval_seconds)
+        self.active_hours = active_hours
+        self.heartbeat_path = runtime.workspace_dir / "HEARTBEAT.md"
+        self._output_queue: list[str] = []
+        self._queue_lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self.last_run_at = 0.0
+        self.last_output = ""
+        self.running = False
+        self._heartbeat_cache = ""
+        self._heartbeat_refreshed_at = 0.0
+
+    def _refresh_heartbeat_if_stale(self) -> tuple[bool, str]:
+        if not self.heartbeat_path.is_file():
+            self._heartbeat_cache = ""
+            return False, "HEARTBEAT.md not found"
+        now = time.time()
+        if (
+            self._heartbeat_cache
+            and now - self._heartbeat_refreshed_at < HEARTBEAT_REFRESH_SECONDS
+        ):
+            return True, self._heartbeat_cache
+        try:
+            instructions = self.heartbeat_path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            self._heartbeat_cache = ""
+            return False, f"read error: {exc}"
+        if not instructions:
+            self._heartbeat_cache = ""
+            return False, "HEARTBEAT.md is empty"
+        self._heartbeat_cache = instructions
+        self._heartbeat_refreshed_at = now
+        self.runtime.bootstrap_data["HEARTBEAT.md"] = instructions
+        return True, instructions
+
+    def should_run(self) -> tuple[bool, str]:
+        """4 项前置检查. 锁的检测在 _execute() 中单独处理."""
+        ok, reason = self._refresh_heartbeat_if_stale()
+        if not ok:
+            return False, reason
+        now = time.time()
+        if now - self.last_run_at < self.interval_seconds:
+            return False, "interval not reached"
+        hour = datetime.now().hour
+        start_hour, end_hour = self.active_hours
+        in_hours = (
+            start_hour <= hour < end_hour
+            if start_hour <= end_hour
+            else not (end_hour <= hour < start_hour)
+        )
+        if not in_hours:
+            return False, f"outside active hours ({start_hour}:00-{end_hour}:00)"
+        if self.running:
+            return False, "already running"
+        return True, "all checks passed"
+
+    def _parse_response(self, response: str) -> str | None:
+        """HEARTBEAT_OK 表示没有需要报告的内容."""
+        if "HEARTBEAT_OK" in response:
+            stripped = response.replace("HEARTBEAT_OK", "").strip()
+            return stripped if len(stripped) > 5 else None
+        stripped = response.strip()
+        return stripped or None
+
+    def _build_prompt(self) -> tuple[str, str]:
+        """读取 heartbeat 指令, 追加已知上下文与当前时间, 组装本轮提示词."""
+        ok, instructions = self._refresh_heartbeat_if_stale()
+        if not ok:
+            raise RuntimeError(instructions)
+        extra_lines = [
+            "You are performing a scheduled heartbeat check.",
+            "Follow only the checklist in HEARTBEAT.md.",
+            "Return HEARTBEAT_OK if nothing needs user attention.",
+            "",
+            "## Heartbeat Runtime",
+            f"- Agent ID: {self.agent.id}",
+            f"- Agent Name: {self.agent.name}",
+            f"- Workspace: {self.runtime.workspace_dir}",
+            f"- Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "- Prompt mode: minimal",
+        ]
+        memory_text = self.runtime.memory_store.load_evergreen().strip()
+        if memory_text:
+            extra_lines.extend(["", "## Known Context", memory_text])
+        system_prompt = build_system_prompt(
+            self.agent,
+            self.runtime,
+            memory_context="",
+            mode="minimal",
+            channel="heartbeat",
+        )
+        return instructions, system_prompt + "\n\n" + "\n".join(extra_lines)
+
+    def _execute(self) -> None:
+        """执行一次 heartbeat 运行. 非阻塞获取锁; 如果忙则跳过."""
+        lane_lock = self.runtime.lane_lock
+        if lane_lock is None:
+            return
+        acquired = lane_lock.acquire(blocking=False)
+        if not acquired:
+            return
+        self.running = True
+        try:
+            user_text, system_prompt = self._build_prompt()
+            output = run_background_single_turn(
+                self.agent,
+                self.runtime,
+                self.guard,
+                user_text,
+                system_prompt=system_prompt,
+                channel="heartbeat",
+            )
+            parsed = self._parse_response(output)
+            if parsed and parsed != self.last_output:
+                self.last_output = parsed
+                with self._queue_lock:
+                    self._output_queue.append(f"[heartbeat:{self.agent.id}] {parsed}")
+            self.last_run_at = time.time()
+        finally:
+            self.running = False
+            lane_lock.release()
+
+    def _loop(self) -> None:
+        while not self._stop_event.is_set():
+            ok, _ = self.should_run()
+            if ok:
+                self._execute()
+            self._stop_event.wait(CRON_POLL_SECONDS)
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def drain_output(self) -> list[str]:
+        with self._queue_lock:
+            items = list(self._output_queue)
+            self._output_queue.clear()
+            return items
+
+    def trigger(self) -> str:
+        """手动触发 heartbeat, 绕过间隔检查."""
+        if self.running:
+            return "heartbeat already running"
+        self._execute()
+        return "heartbeat triggered"
+
+    def status(self) -> dict[str, Any]:
+        ok, reason = self.should_run()
+        return {
+            "agent_id": self.agent.id,
+            "enabled": self.heartbeat_path.is_file(),
+            "path": str(self.heartbeat_path),
+            "running": self.running,
+            "last_run": (
+                datetime.fromtimestamp(self.last_run_at).isoformat()
+                if self.last_run_at > 0
+                else "never"
+            ),
+            "next_check_ready": ok,
+            "reason": reason,
+            "interval_seconds": self.interval_seconds,
+            "active_hours": self.active_hours,
+            "queued": len(self._output_queue),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Agent 辅助函数 -- 单轮 LLM 调用 (heartbeat 和 cron 共用)
+# ---------------------------------------------------------------------------
+def run_background_single_turn(
+    agent: AgentConfig,
+    runtime: AgentRuntime,
+    guard: "ContextGuard",
+    user_text: str,
+    *,
+    extra_context: str = "",
+    system_prompt: str | None = None,
+    channel: str = "cron",
+) -> str:
+    prompt = system_prompt or build_system_prompt(
+        agent,
+        runtime,
+        memory_context="",
+        mode="minimal",
+        channel=channel,
+    )
+    if extra_context:
+        prompt = prompt + "\n\n" + extra_context
+    response = guard.guard_api_call(
+        api_client=client,
+        model=agent.effective_model,
+        system=prompt,
+        messages=[{"role": "user", "content": user_text}],
+        tools=None,
+        max_retries=1,
+    )
+    return extract_text(response.content).strip()
+
+
 # -------------------------------------------------------------
 # 工具实现
 # -------------------------------------------------------------
@@ -1821,6 +2296,7 @@ class AgentManager:
             skills_mgr=skills_mgr,
             skills_index_block=skills_mgr.format_index_block(),
             memory_store=memory_store,
+            lane_lock=threading.Lock(),
         )
         return normalized
 
@@ -2259,6 +2735,19 @@ def current_cli_runtime(agent_mgr: AgentManager) -> AgentRuntime | None:
     return agent_mgr.get_runtime(DEFAULT_AGENT_ID)
 
 
+def drain_background_outputs(agent_mgr: AgentManager) -> None:
+    for agent in agent_mgr.list_agents():
+        runtime = agent_mgr.get_runtime(agent.id)
+        if runtime is None:
+            continue
+        if runtime.heartbeat_runner is not None:
+            for item in runtime.heartbeat_runner.drain_output():
+                print_assistant(item)
+        if runtime.cron_service is not None:
+            for item in runtime.cron_service.drain_output():
+                print_assistant(item)
+
+
 def handle_repl_command(
     command: str,
     store: SessionStore,
@@ -2425,6 +2914,62 @@ def handle_repl_command(
 
     runtime = current_cli_runtime(agent_mgr)
 
+    if cmd == "/heartbeat":
+        print_section("Heartbeat Status")
+        if runtime is None or runtime.heartbeat_runner is None:
+            print(f"{DIM}(Heartbeat is not initialized){RESET}")
+            return True, messages, None
+        status = runtime.heartbeat_runner.status()
+        print(f"  Agent: {status['agent_id']}")
+        print(f"  File: {status['path']}")
+        print(f"  Running: {status['running']}")
+        print(f"  Last run: {status['last_run']}")
+        print(f"  Ready: {status['next_check_ready']}")
+        print(f"  Reason: {status['reason']}")
+        print(f"  Queue: {status['queued']}")
+        return True, messages, None
+
+    if cmd == "/cron":
+        print_section("Cron Jobs")
+        if runtime is None or runtime.cron_service is None:
+            print(f"{DIM}(Cron service is not initialized){RESET}")
+            return True, messages, None
+        jobs = runtime.cron_service.list_jobs()
+        if not jobs:
+            print(f"{DIM}(No cron jobs loaded){RESET}")
+            return True, messages, None
+        for job in jobs:
+            print(
+                f"  {job['id']} | {job['name']} | enabled={job['enabled']} "
+                f"kind={job['kind']} errors={job['errors']}"
+            )
+            print(
+                f"    last={job['last_run']} next={job['next_run']} "
+                f"next_in={job['next_in']}s"
+            )
+        return True, messages, None
+
+    if cmd == "/cron-trigger":
+        if not arg:
+            print_warn("  Usage: /cron-trigger <job_id>")
+            return True, messages, None
+        if runtime is None or runtime.cron_service is None:
+            print_warn("  Cron service is not initialized")
+            return True, messages, None
+        print_info(f"  {runtime.cron_service.trigger_job(arg.strip())}")
+        return True, messages, None
+
+    if cmd == "/lanes":
+        print_section("Lane Status")
+        if runtime is None:
+            print(f"{DIM}(No current agent runtime){RESET}")
+            return True, messages, None
+        print(f"  Agent: {runtime.agent_id}")
+        print(f"  Lane lock: {'ready' if runtime.lane_lock is not None else 'missing'}")
+        print(f"  Heartbeat: {'on' if runtime.heartbeat_runner is not None else 'off'}")
+        print(f"  Cron: {'on' if runtime.cron_service is not None else 'off'}")
+        return True, messages, None
+
     if cmd == "/soul":
         print_section("SOUL.md")
         soul = runtime.bootstrap_data.get("SOUL.md", "") if runtime else ""
@@ -2526,6 +3071,10 @@ def handle_repl_command(
         print_info("    /route ...         Preview route resolution")
         print_info("    /sessions [agent]  List sessions")
         print_info("    /agent <id|off>    Force CLI agent")
+        print_info("    /heartbeat         Show current heartbeat status")
+        print_info("    /cron              List current cron jobs")
+        print_info("    /cron-trigger <id> Trigger a cron job")
+        print_info("    /lanes             Show background lane status")
         print_info("    /soul              Show current agent SOUL.md")
         print_info("    /skills            List current agent skills")
         print_info("    /memory            Show current agent memory stats")
@@ -2552,99 +3101,104 @@ def run_agent_session_turn(
     guard: ContextGuard,
     mgr: ChannelManager,
 ) -> None:
-    messages.append({"role": "user", "content": inbound.text})
-    store.save_turn(session_key, "user", inbound.text)
+    lane_lock = runtime.lane_lock
+    if lane_lock is None:
+        lane_lock = threading.Lock()
+        runtime.lane_lock = lane_lock
+    with lane_lock:
+        messages.append({"role": "user", "content": inbound.text})
+        store.save_turn(session_key, "user", inbound.text)
 
-    while True:
-        memory_context = _auto_recall(runtime, inbound.text)
-        if memory_context:
-            print_info(f"  [memory] auto recall hit for agent:{runtime.agent_id}")
-        loaded_skills = _collect_loaded_skills(messages)
-        system_prompt = build_system_prompt(
-            agent,
-            runtime,
-            loaded_skills=loaded_skills,
-            memory_context=memory_context,
-            channel=inbound.channel or "cli",
-        )
-
-        try:
-            response = guard.guard_api_call(
-                api_client=client,
-                model=agent.effective_model,
-                system=system_prompt,
-                messages=messages,
-                tools=TOOLS,
+        while True:
+            memory_context = _auto_recall(runtime, inbound.text)
+            if memory_context:
+                print_info(f"  [memory] auto recall hit for agent:{runtime.agent_id}")
+            loaded_skills = _collect_loaded_skills(messages)
+            system_prompt = build_system_prompt(
+                agent,
+                runtime,
+                loaded_skills=loaded_skills,
+                memory_context=memory_context,
+                channel=inbound.channel or "cli",
             )
-        except Exception as exc:
-            print(f"\n{YELLOW}API Error: {exc}{RESET}\n")
-            while messages and messages[-1]["role"] != "user":
-                messages.pop()
-            if messages:
-                messages.pop()
-            return
 
-        messages.append({"role": "assistant", "content": response.content})
-
-        serialized_content = []
-        for block in response.content:
-            if hasattr(block, "text"):
-                serialized_content.append(
-                    {"type": "text", "text": cast(Any, block).text}
+            try:
+                response = guard.guard_api_call(
+                    api_client=client,
+                    model=agent.effective_model,
+                    system=system_prompt,
+                    messages=messages,
+                    tools=TOOLS,
                 )
-            elif is_tool_use_block(block):
-                tool_use_block = cast(Any, block)
-                serialized_content.append(
-                    {
-                        "type": "tool_use",
-                        "id": tool_use_block.id,
-                        "name": tool_use_block.name,
-                        "input": tool_use_block.input,
-                    }
-                )
-        store.save_turn(session_key, "assistant", serialized_content)
+            except Exception as exc:
+                print(f"\n{YELLOW}API Error: {exc}{RESET}\n")
+                while messages and messages[-1]["role"] != "user":
+                    messages.pop()
+                if messages:
+                    messages.pop()
+                return
 
-        if response.stop_reason == "end_turn":
+            messages.append({"role": "assistant", "content": response.content})
+
+            serialized_content = []
+            for block in response.content:
+                if hasattr(block, "text"):
+                    serialized_content.append(
+                        {"type": "text", "text": cast(Any, block).text}
+                    )
+                elif is_tool_use_block(block):
+                    tool_use_block = cast(Any, block)
+                    serialized_content.append(
+                        {
+                            "type": "tool_use",
+                            "id": tool_use_block.id,
+                            "name": tool_use_block.name,
+                            "input": tool_use_block.input,
+                        }
+                    )
+            store.save_turn(session_key, "assistant", serialized_content)
+
+            if response.stop_reason == "end_turn":
+                assistant_text = extract_text(response.content)
+                if assistant_text:
+                    mgr.broadcast(inbound, assistant_text)
+                return
+
+            if response.stop_reason == "tool_use":
+                tool_results = []
+                for block in response.content:
+                    if not is_tool_use_block(block):
+                        continue
+
+                    tool_use_block = cast(Any, block)
+                    result = process_tool_call(
+                        tool_use_block.name,
+                        tool_use_block.input,
+                        runtime=runtime,
+                    )
+                    store.save_tool_result(
+                        session_key,
+                        tool_use_block.id,
+                        tool_use_block.name,
+                        tool_use_block.input,
+                        result,
+                    )
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_block.id,
+                            "content": result,
+                        }
+                    )
+
+                messages.append({"role": "user", "content": tool_results})
+                continue
+
+            print_info(f"[stop_reason={response.stop_reason}]")
             assistant_text = extract_text(response.content)
             if assistant_text:
                 mgr.broadcast(inbound, assistant_text)
             return
-
-        if response.stop_reason == "tool_use":
-            tool_results = []
-            for block in response.content:
-                if not is_tool_use_block(block):
-                    continue
-
-                tool_use_block = cast(Any, block)
-                result = process_tool_call(
-                    tool_use_block.name,
-                    tool_use_block.input,
-                    runtime=runtime,
-                )
-                store.save_tool_result(
-                    session_key,
-                    tool_use_block.id,
-                    tool_use_block.name,
-                    tool_use_block.input,
-                    result,
-                )
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_use_block.id,
-                        "content": result,
-                    }
-                )
-
-            messages.append({"role": "user", "content": tool_results})
-            continue
-
-        print_info(f"[stop_reason={response.stop_reason}]")
-        assistant_text = extract_text(response.content)
-        if assistant_text:
-            mgr.broadcast(inbound, assistant_text)
-        return
 
 
 def dispatch_inbound(
@@ -2805,6 +3359,26 @@ def agent_loop() -> None:
     agent_mgr.set_cli_focus(cli_session_key)
     print_session(f"  CLI session: {cli_session_key} ({len(cli_messages)} messages)")
 
+    for agent in agent_mgr.list_agents():
+        runtime = agent_mgr.get_runtime(agent.id)
+        if runtime is None:
+            continue
+        runtime.heartbeat_runner = HeartbeatRunner(agent, runtime, guard)
+        runtime.cron_service = CronService(agent, runtime, guard)
+        runtime.heartbeat_runner.start()
+
+        def cron_loop(rt: AgentRuntime) -> None:
+            while True:
+                if rt.cron_service is None:
+                    return
+                rt.cron_service.tick()
+                time.sleep(CRON_POLL_SECONDS)
+
+        runtime.cron_thread = threading.Thread(
+            target=cron_loop, args=(runtime,), daemon=True
+        )
+        runtime.cron_thread.start()
+
     print_info("=" * 60)
     print_info(f"  Model: {MODEL_ID}")
     print_info(f"  Workdir: {WORKDIR}")
@@ -2821,11 +3395,15 @@ def agent_loop() -> None:
                 "daily_entries": 0,
             }
         )
+        cron_jobs = (
+            len(runtime.cron_service.jobs) if runtime and runtime.cron_service else 0
+        )
         print_info(f"    - {agent.id}: workspace={agent.workspace_dir}")
         print_info(
             f"      bootstrap={len(runtime.bootstrap_data) if runtime else 0} "
             f"skills={len(runtime.skills_mgr.skills) if runtime else 0} "
-            f"memory={stats['evergreen_chars']}c/{stats['daily_files']}f/{stats['daily_entries']}e"
+            f"memory={stats['evergreen_chars']}c/{stats['daily_files']}f/{stats['daily_entries']}e "
+            f"cron_jobs={cron_jobs}"
         )
     print_info(f"  Bindings: {len(bindings.list_all())}")
     print_info(
@@ -2843,6 +3421,7 @@ def agent_loop() -> None:
 
     try:
         while True:
+            drain_background_outputs(agent_mgr)
             inbound = http_channel.receive()
             if inbound is None:
                 try:
@@ -2884,6 +3463,10 @@ def agent_loop() -> None:
             if inbound.channel == "cli":
                 spawn_cli_reader()
     finally:
+        for agent in agent_mgr.list_agents():
+            runtime = agent_mgr.get_runtime(agent.id)
+            if runtime and runtime.heartbeat_runner is not None:
+                runtime.heartbeat_runner.stop()
         mgr.close_all()
 
 

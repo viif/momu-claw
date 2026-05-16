@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "anthropic>=0.100.0",
+    "croniter>=6.2.2",
     "python-dotenv>=1.2.2",
     "websockets>=16.0",
 ]
