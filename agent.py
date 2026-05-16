@@ -80,14 +80,13 @@ DEFAULT_AGENT_ID = "main"
 VALID_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 INVALID_CHARS_RE = re.compile(r"[^a-z0-9_-]+")
 
-# Intelligence 配置
-BOOTSTRAP_FILES = [
+# 工作区上下文文件列表与限制
+WORKSPACE_CONTEXT_FILES = [
     "SOUL.md",
     "IDENTITY.md",
     "TOOLS.md",
     "USER.md",
     "HEARTBEAT.md",
-    "BOOTSTRAP.md",
     "AGENTS.md",
     "MEMORY.md",
 ]
@@ -102,6 +101,11 @@ CRON_POLL_SECONDS = 1.0
 CRON_FILE_NAME = "CRON.json"
 CRON_RUN_LOG_NAME = "cron-runs.jsonl"
 CRON_AUTO_DISABLE_THRESHOLD = 3
+BOOTSTRAP_DONE_FILE_NAME = ".bootstrap.done"
+BOOTSTRAP_PROMPT_HEADER = (
+    "Bootstrap initialization is required for this workspace. "
+    "Use the following instructions only for this startup conversation.\n\n"
+)
 
 
 # --------------------------------------------------------------
@@ -154,6 +158,17 @@ def extract_text(blocks: Sequence[object]) -> str:
         elif hasattr(block, "text"):
             text += cast(Any, block).text
     return text
+
+
+def build_bootstrap_turn_input(loader: "WorkspaceContextLoader", user_text: str) -> str:
+    bootstrap_text = loader.load_bootstrap_once().strip()
+    if not bootstrap_text:
+        return user_text
+    return (
+        f"{BOOTSTRAP_PROMPT_HEADER}{bootstrap_text}\n\n"
+        "After completing this bootstrap conversation, continue normal collaboration."
+        f"\n\nCurrent user message:\n{user_text}"
+    )
 
 
 # -------------------------------------------------------------
@@ -303,7 +318,7 @@ class AgentConfig:
 class AgentRuntime:
     agent_id: str
     workspace_dir: Path
-    bootstrap_data: dict[str, str]
+    workspace_context: dict[str, str]
     skills_mgr: "SkillsManager"
     skills_index_block: str
     memory_store: "MemoryStore"
@@ -593,14 +608,24 @@ def truncate(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
 
 
 # --------------------------------------------------------------
-# Bootstrap 文件加载器
+# 工作区上下文加载器
 # --------------------------------------------------------------
-# 在 agent 启动时加载工作区的 Bootstrap 文件.
+# 在 agent 启动时加载工作区上下文文件.
 # 不同加载模式 (full/minimal/none) 适用于不同场景:
 #   full = 主 agent | minimal = 子 agent / cron | none = 最小化
-class BootstrapLoader:
+# 其中 BOOTSTRAP.md 不属于常驻运行时上下文, 仅在首次启动引导时单独读取.
+class WorkspaceContextLoader:
     def __init__(self, workspace_dir: Path) -> None:
         self.workspace_dir = workspace_dir
+
+    def bootstrap_done_path(self) -> Path:
+        return self.workspace_dir / BOOTSTRAP_DONE_FILE_NAME
+
+    def is_bootstrap_done(self) -> bool:
+        return self.bootstrap_done_path().is_file()
+
+    def mark_bootstrap_done(self) -> None:
+        self.bootstrap_done_path().write_text("done\n", encoding="utf-8")
 
     def load_file(self, name: str) -> str:
         path = self.workspace_dir / name
@@ -610,6 +635,14 @@ class BootstrapLoader:
             return path.read_text(encoding="utf-8")
         except Exception:
             return ""
+
+    def load_bootstrap_once(self) -> str:
+        if self.is_bootstrap_done():
+            return ""
+        raw = self.load_file("BOOTSTRAP.md")
+        if not raw:
+            return ""
+        return self.truncate_file(raw)
 
     def truncate_file(self, content: str, max_chars: int = MAX_FILE_CHARS) -> str:
         """截断超长文件内容. 仅保留头部, 在行边界处截断."""
@@ -627,7 +660,9 @@ class BootstrapLoader:
         if mode == "none":
             return {}
         names = (
-            ["AGENTS.md", "TOOLS.md"] if mode == "minimal" else list(BOOTSTRAP_FILES)
+            ["AGENTS.md", "TOOLS.md"]
+            if mode == "minimal"
+            else list(WORKSPACE_CONTEXT_FILES)
         )
         result: dict[str, str] = {}
         total = 0
@@ -1135,21 +1170,21 @@ def build_system_prompt(
     mode: str = "full",
     channel: str = "cli",
 ) -> str:
-    bootstrap = runtime.bootstrap_data
+    context_files = runtime.workspace_context
     sections: list[str] = []
 
     # 第 1 层: 身份 -- 优先 IDENTITY.md, 否则回退到默认值
-    identity = bootstrap.get("IDENTITY.md", "").strip()
+    identity = context_files.get("IDENTITY.md", "").strip()
     sections.append(identity if identity else SYSTEM_PROMPT)
 
     # 第 2 层: 灵魂 -- 人格注入, 越靠前影响力越强
     if mode == "full":
-        soul = bootstrap.get("SOUL.md", "").strip()
+        soul = context_files.get("SOUL.md", "").strip()
         if soul:
             sections.append(f"## Personality\n\n{soul}")
 
     # 第 3 层: 工具使用指南
-    tools_md = bootstrap.get("TOOLS.md", "").strip()
+    tools_md = context_files.get("TOOLS.md", "").strip()
     if tools_md:
         sections.append(f"## Tool Usage Guidelines\n\n{tools_md}")
 
@@ -1165,7 +1200,7 @@ def build_system_prompt(
 
     # 第 5 层: 记忆 -- 长期记忆 + 本轮自动搜索结果
     if mode == "full":
-        memory_md = bootstrap.get("MEMORY.md", "").strip()
+        memory_md = context_files.get("MEMORY.md", "").strip()
         memory_parts: list[str] = []
         if memory_md:
             memory_parts.append(f"### Evergreen Memory\n\n{memory_md}")
@@ -1182,10 +1217,10 @@ def build_system_prompt(
             "- Use memory_search to recall specific past information."
         )
 
-    # 第 6 层: Bootstrap 上下文 -- 剩余的 Bootstrap 文件
+    # 第 6 层: 工作区上下文文件 -- 剩余的常驻上下文文件
     if mode in ("full", "minimal"):
-        for name in ["HEARTBEAT.md", "BOOTSTRAP.md", "AGENTS.md", "USER.md"]:
-            content = bootstrap.get(name, "").strip()
+        for name in ["HEARTBEAT.md", "AGENTS.md", "USER.md"]:
+            content = context_files.get(name, "").strip()
             if content:
                 sections.append(f"## {name.replace('.md', '')}\n\n{content}")
 
@@ -1528,7 +1563,7 @@ class HeartbeatRunner:
             return False, "HEARTBEAT.md is empty"
         self._heartbeat_cache = instructions
         self._heartbeat_refreshed_at = now
-        self.runtime.bootstrap_data["HEARTBEAT.md"] = instructions
+        self.runtime.workspace_context["HEARTBEAT.md"] = instructions
         return True, instructions
 
     def should_run(self) -> tuple[bool, str]:
@@ -2284,15 +2319,15 @@ class AgentManager:
             workspace_dir=str(workspace_dir),
         )
         self._agents[aid] = normalized
-        loader = BootstrapLoader(workspace_dir)
-        bootstrap_data = loader.load_all(mode="full")
+        loader = WorkspaceContextLoader(workspace_dir)
+        workspace_context = loader.load_all(mode="full")
         skills_mgr = SkillsManager(workspace_dir)
         skills_mgr.discover()
         memory_store = MemoryStore(workspace_dir)
         self._runtimes[aid] = AgentRuntime(
             agent_id=aid,
             workspace_dir=workspace_dir,
-            bootstrap_data=bootstrap_data,
+            workspace_context=workspace_context,
             skills_mgr=skills_mgr,
             skills_index_block=skills_mgr.format_index_block(),
             memory_store=memory_store,
@@ -2691,14 +2726,14 @@ def cmd_agents(agent_mgr: AgentManager) -> None:
     for agent in agents:
         runtime = agent_mgr.get_runtime(agent.id)
         memory_stats = runtime.memory_store.get_stats() if runtime else {}
-        bootstrap_count = len(runtime.bootstrap_data) if runtime else 0
+        workspace_context_count = len(runtime.workspace_context) if runtime else 0
         skills_count = len(runtime.skills_mgr.skills) if runtime else 0
         print_info(
             f"    {agent.id} ({agent.name}) model={agent.effective_model} "
             f"dm_scope={agent.dm_scope} workspace={agent.workspace_dir}"
         )
         print_info(
-            f"      bootstrap={bootstrap_count} skills={skills_count} "
+            f"      workspace_context={workspace_context_count} skills={skills_count} "
             f"memory={memory_stats.get('evergreen_chars', 0)}c/"
             f"{memory_stats.get('daily_files', 0)}f/"
             f"{memory_stats.get('daily_entries', 0)}e"
@@ -2972,7 +3007,7 @@ def handle_repl_command(
 
     if cmd == "/soul":
         print_section("SOUL.md")
-        soul = runtime.bootstrap_data.get("SOUL.md", "") if runtime else ""
+        soul = runtime.workspace_context.get("SOUL.md", "") if runtime else ""
         print(soul if soul else f"{DIM}(SOUL.md not found){RESET}")
         return True, messages, None
 
@@ -3044,15 +3079,16 @@ def handle_repl_command(
         print(f"\n{DIM}Total prompt length: {len(prompt)} chars{RESET}")
         return True, messages, None
 
-    if cmd == "/bootstrap":
-        print_section("Bootstrap Files")
-        if runtime is None or not runtime.bootstrap_data:
-            print(f"{DIM}(No Bootstrap files loaded){RESET}")
+    if cmd == "/context-files":
+        print_section("Workspace Context Files")
+        if runtime is None or not runtime.workspace_context:
+            print(f"{DIM}(No workspace context files loaded){RESET}")
         else:
-            for name, content in runtime.bootstrap_data.items():
+            for name, content in runtime.workspace_context.items():
                 print(f"  {BLUE}{name}{RESET}: {len(content)} chars")
         total = sum(
-            len(value) for value in (runtime.bootstrap_data.values() if runtime else [])
+            len(value)
+            for value in (runtime.workspace_context.values() if runtime else [])
         )
         print(f"\n  {DIM}Total: {total} chars (limit: {MAX_TOTAL_CHARS}){RESET}")
         return True, messages, None
@@ -3080,7 +3116,7 @@ def handle_repl_command(
         print_info("    /memory            Show current agent memory stats")
         print_info("    /search <query>    Search current agent memory")
         print_info("    /prompt            Show current agent system prompt")
-        print_info("    /bootstrap         Show current agent bootstrap files")
+        print_info("    /context-files     Show current agent workspace context files")
         print_info("    /help              Show this help")
         print_info("    quit / exit        Exit the REPL")
         return True, messages, None
@@ -3106,8 +3142,10 @@ def run_agent_session_turn(
         lane_lock = threading.Lock()
         runtime.lane_lock = lane_lock
     with lane_lock:
-        messages.append({"role": "user", "content": inbound.text})
-        store.save_turn(session_key, "user", inbound.text)
+        loader = WorkspaceContextLoader(runtime.workspace_dir)
+        turn_input = build_bootstrap_turn_input(loader, inbound.text)
+        messages.append({"role": "user", "content": turn_input})
+        store.save_turn(session_key, "user", turn_input)
 
         while True:
             memory_context = _auto_recall(runtime, inbound.text)
@@ -3162,6 +3200,8 @@ def run_agent_session_turn(
                 assistant_text = extract_text(response.content)
                 if assistant_text:
                     mgr.broadcast(inbound, assistant_text)
+                if turn_input != inbound.text:
+                    loader.mark_bootstrap_done()
                 return
 
             if response.stop_reason == "tool_use":
@@ -3198,6 +3238,8 @@ def run_agent_session_turn(
             assistant_text = extract_text(response.content)
             if assistant_text:
                 mgr.broadcast(inbound, assistant_text)
+            if turn_input != inbound.text:
+                loader.mark_bootstrap_done()
             return
 
 
@@ -3400,7 +3442,7 @@ def agent_loop() -> None:
         )
         print_info(f"    - {agent.id}: workspace={agent.workspace_dir}")
         print_info(
-            f"      bootstrap={len(runtime.bootstrap_data) if runtime else 0} "
+            f"      workspace_context={len(runtime.workspace_context) if runtime else 0} "
             f"skills={len(runtime.skills_mgr.skills) if runtime else 0} "
             f"memory={stats['evergreen_chars']}c/{stats['daily_files']}f/{stats['daily_entries']}e "
             f"cron_jobs={cron_jobs}"
