@@ -54,6 +54,7 @@ client = Anthropic(
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant with access to tools.\n"
     "Use the tools to help the user with file operations and shell commands.\n"
+    "By default, file paths and shell commands should be interpreted relative to the current agent workspace unless the tool description says otherwise.\n"
     "Always read a file before editing it.\n"
     "When using edit_file, the old_string must match EXACTLY (including whitespace)."
 )
@@ -169,6 +170,13 @@ def build_bootstrap_turn_input(loader: "WorkspaceContextLoader", user_text: str)
         "After completing this bootstrap conversation, continue normal collaboration."
         f"\n\nCurrent user message:\n{user_text}"
     )
+
+
+def should_mark_bootstrap_done(loader: "WorkspaceContextLoader") -> bool:
+    has_user = bool(loader.load_file("USER.md").strip())
+    has_identity = bool(loader.load_file("IDENTITY.md").strip())
+    has_soul = bool(loader.load_file("SOUL.md").strip())
+    return has_user and (has_identity or has_soul)
 
 
 # -------------------------------------------------------------
@@ -589,12 +597,16 @@ def receive_cli_input(
 # -------------------------------------------------------------
 # 安全辅助函数
 # -------------------------------------------------------------
-def safe_path(raw: str) -> Path:
+def safe_path(raw: str, base_dir: Path | None = None) -> Path:
     """
     将用户/模型传入的路径解析为安全的绝对路径.
-    防止路径穿越: 最终路径必须在 WORKDIR 之下.
+    相对路径默认相对当前 agent workspace 解析; 最终路径必须在 WORKDIR 之下.
     """
-    target = (WORKDIR / raw).resolve()
+    base = (base_dir or WORKDIR).resolve()
+    raw_path = Path(raw)
+    target = (
+        raw_path.resolve() if raw_path.is_absolute() else (base / raw_path).resolve()
+    )
     if not str(target).startswith(str(WORKDIR.resolve())):
         raise ValueError(f"Path traversal blocked: {raw} resolves outside WORKDIR")
     return target
@@ -1232,7 +1244,8 @@ def build_system_prompt(
         f"- Agent Name: {agent.name}\n"
         f"- Model: {agent.effective_model}\n"
         f"- Channel: {channel}\n"
-        f"- Workspace: {runtime.workspace_dir}\n"
+        f"- Agent workspace: {runtime.workspace_dir}\n"
+        "- Shell working directory: defaults to the current agent workspace when using bash\n"
         f"- Current time: {now}\n"
         f"- Prompt mode: {mode}"
     )
@@ -1741,7 +1754,9 @@ def run_background_single_turn(
 # -------------------------------------------------------------
 # 工具实现
 # -------------------------------------------------------------
-def tool_bash(command: str, timeout: int = 30) -> str:
+def tool_bash(
+    command: str, timeout: int = 30, runtime: "AgentRuntime | None" = None
+) -> str:
     """执行 shell 命令并返回输出."""
     dangerous = ["rm -rf /", "mkfs", "> /dev/sd", "dd if="]
     for pattern in dangerous:
@@ -1750,13 +1765,14 @@ def tool_bash(command: str, timeout: int = 30) -> str:
 
     print_tool("bash", command)
     try:
+        cwd = runtime.workspace_dir if runtime is not None else WORKDIR
         result = subprocess.run(
             command,
             shell=True,
             capture_output=True,
             text=True,
             timeout=timeout,
-            cwd=str(WORKDIR),
+            cwd=str(cwd),
         )
         output = ""
         if result.stdout:
@@ -1774,11 +1790,12 @@ def tool_bash(command: str, timeout: int = 30) -> str:
         return f"Error: {exc}"
 
 
-def tool_read_file(file_path: str) -> str:
+def tool_read_file(file_path: str, runtime: "AgentRuntime | None" = None) -> str:
     """读取文件内容."""
     print_tool("read_file", file_path)
     try:
-        target = safe_path(file_path)
+        base_dir = runtime.workspace_dir if runtime is not None else WORKDIR
+        target = safe_path(file_path, base_dir=base_dir)
         if not target.exists():
             return f"Error: File not found: {file_path}"
         if not target.is_file():
@@ -1791,11 +1808,14 @@ def tool_read_file(file_path: str) -> str:
         return f"Error: {exc}"
 
 
-def tool_write_file(file_path: str, content: str) -> str:
+def tool_write_file(
+    file_path: str, content: str, runtime: "AgentRuntime | None" = None
+) -> str:
     """写入内容到文件. 父目录不存在时自动创建."""
     print_tool("write_file", file_path)
     try:
-        target = safe_path(file_path)
+        base_dir = runtime.workspace_dir if runtime is not None else WORKDIR
+        target = safe_path(file_path, base_dir=base_dir)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         return f"Successfully wrote {len(content)} chars to {file_path}"
@@ -1805,14 +1825,20 @@ def tool_write_file(file_path: str, content: str) -> str:
         return f"Error: {exc}"
 
 
-def tool_edit_file(file_path: str, old_string: str, new_string: str) -> str:
+def tool_edit_file(
+    file_path: str,
+    old_string: str,
+    new_string: str,
+    runtime: "AgentRuntime | None" = None,
+) -> str:
     """
     精确替换文件中的文本.
     old_string 必须在文件中恰好出现一次, 否则报错.
     """
     print_tool("edit_file", f"{file_path} (replace {len(old_string)} chars)")
     try:
-        target = safe_path(file_path)
+        base_dir = runtime.workspace_dir if runtime is not None else WORKDIR
+        target = safe_path(file_path, base_dir=base_dir)
         if not target.exists():
             return f"Error: File not found: {file_path}"
 
@@ -1836,8 +1862,9 @@ def tool_edit_file(file_path: str, old_string: str, new_string: str) -> str:
         return f"Error: {exc}"
 
 
-def tool_get_current_time() -> str:
+def tool_get_current_time(runtime: "AgentRuntime | None" = None) -> str:
     """返回当前 UTC 时间."""
+    _ = runtime
     print_tool("get_current_time", "")
     now = datetime.now(timezone.utc)
     return now.strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -1882,6 +1909,7 @@ TOOLS: list[ToolParam] = [
         "name": "bash",
         "description": (
             "Run a shell command and return its output. "
+            "Commands run in the current agent workspace by default, or in the repo root when no active runtime exists. "
             "Use for system commands, git, package managers, etc."
         ),
         "input_schema": {
@@ -1907,7 +1935,7 @@ TOOLS: list[ToolParam] = [
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Path to the file (relative to working directory).",
+                    "description": "Path to the file (relative to the current agent workspace by default).",
                 },
             },
             "required": ["file_path"],
@@ -1924,7 +1952,7 @@ TOOLS: list[ToolParam] = [
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Path to the file (relative to working directory).",
+                    "description": "Path to the file (relative to the current agent workspace by default).",
                 },
                 "content": {
                     "type": "string",
@@ -1946,7 +1974,7 @@ TOOLS: list[ToolParam] = [
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Path to the file (relative to working directory).",
+                    "description": "Path to the file (relative to the current agent workspace by default).",
                 },
                 "old_string": {
                     "type": "string",
@@ -2027,6 +2055,9 @@ TOOL_HANDLERS: dict[str, Any] = {
     "write_file": tool_write_file,
     "edit_file": tool_edit_file,
     "get_current_time": tool_get_current_time,
+    "memory_write": tool_memory_write,
+    "memory_search": tool_memory_search,
+    "load_skill": tool_load_skill,
 }
 
 MEMORY_TOOL_NAMES = {"memory_write", "memory_search", "load_skill"}
@@ -2037,35 +2068,11 @@ def process_tool_call(
     tool_input: dict[str, Any],
     runtime: AgentRuntime | None = None,
 ) -> str:
-    if tool_name == "memory_write":
-        try:
-            return tool_memory_write(runtime, **tool_input)
-        except TypeError as exc:
-            return f"Error: Invalid arguments for {tool_name}: {exc}"
-        except Exception as exc:
-            return f"Error: {tool_name} failed: {exc}"
-
-    if tool_name == "memory_search":
-        try:
-            return tool_memory_search(runtime, **tool_input)
-        except TypeError as exc:
-            return f"Error: Invalid arguments for {tool_name}: {exc}"
-        except Exception as exc:
-            return f"Error: {tool_name} failed: {exc}"
-
-    if tool_name == "load_skill":
-        try:
-            return tool_load_skill(runtime, **tool_input)
-        except TypeError as exc:
-            return f"Error: Invalid arguments for {tool_name}: {exc}"
-        except Exception as exc:
-            return f"Error: {tool_name} failed: {exc}"
-
     handler = TOOL_HANDLERS.get(tool_name)
     if handler is None:
         return f"Error: Unknown tool '{tool_name}'"
     try:
-        return handler(**tool_input)
+        return handler(runtime=runtime, **tool_input)
     except TypeError as exc:
         return f"Error: Invalid arguments for {tool_name}: {exc}"
     except Exception as exc:
@@ -3200,7 +3207,7 @@ def run_agent_session_turn(
                 assistant_text = extract_text(response.content)
                 if assistant_text:
                     mgr.broadcast(inbound, assistant_text)
-                if turn_input != inbound.text:
+                if turn_input != inbound.text and should_mark_bootstrap_done(loader):
                     loader.mark_bootstrap_done()
                 return
 
@@ -3238,7 +3245,7 @@ def run_agent_session_turn(
             assistant_text = extract_text(response.content)
             if assistant_text:
                 mgr.broadcast(inbound, assistant_text)
-            if turn_input != inbound.text:
+            if turn_input != inbound.text and should_mark_bootstrap_done(loader):
                 loader.mark_bootstrap_done()
             return
 
