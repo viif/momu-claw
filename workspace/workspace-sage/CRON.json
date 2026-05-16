@@ -2,7 +2,7 @@
   "jobs": [
     {
       "id": "sage-good-morning",
-      "name": "Say good morning",
+      "name": "morning-greeting-sage",
       "enabled": true,
       "schedule": {
         "kind": "cron",
@@ -10,7 +10,7 @@
       },
       "payload": {
         "kind": "system_event",
-        "text": "Good morning."
+        "text": "Good morning. Scan for planning work or unresolved analysis requests."
       }
     }
   ]

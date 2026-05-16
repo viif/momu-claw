@@ -2,7 +2,7 @@
   "jobs": [
     {
       "id": "main-good-morning",
-      "name": "Say good morning",
+      "name": "morning-greeting-main",
       "enabled": true,
       "schedule": {
         "kind": "cron",
@@ -10,7 +10,7 @@
       },
       "payload": {
         "kind": "system_event",
-        "text": "Good morning."
+        "text": "Good morning. Review today's queue and surface anything blocking."
       }
     }
   ]
