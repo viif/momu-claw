@@ -296,7 +296,7 @@ class AgentRuntime:
     workspace_dir: Path
     bootstrap_data: dict[str, str]
     skills_mgr: "SkillsManager"
-    skills_block: str
+    skills_index_block: str
     memory_store: "MemoryStore"
 
 
@@ -659,6 +659,10 @@ class SkillsManager:
             meta[key.strip()] = value.strip()
         return meta
 
+    @staticmethod
+    def _normalize_skill_name(value: str) -> str:
+        return re.sub(r"\s+", "-", value.strip().lower())
+
     def _scan_dir(self, base: Path) -> list[dict[str, str]]:
         found: list[dict[str, str]] = []
         if not base.is_dir():
@@ -688,6 +692,7 @@ class SkillsManager:
                     "invocation": meta.get("invocation", ""),
                     "body": body,
                     "path": str(child),
+                    "lookup_name": self._normalize_skill_name(meta.get("name", "")),
                 }
             )
         return found
@@ -707,26 +712,58 @@ class SkillsManager:
                 seen[skill["name"]] = skill
         self.skills = list(seen.values())[:MAX_SKILLS]
 
-    def format_prompt_block(self) -> str:
+    def format_index_block(self) -> str:
         if not self.skills:
             return ""
-        lines = ["## Available Skills", ""]
+        lines = [
+            "## Available Skills",
+            "",
+            "Only the skill catalog is loaded by default.",
+            "Use the load_skill tool before relying on a skill's detailed body.",
+            "",
+        ]
         total = 0
         for skill in self.skills:
+            invocation = skill["invocation"] or "(manual)"
             block = (
                 f"### Skill: {skill['name']}\n"
                 f"Description: {skill['description']}\n"
-                f"Invocation: {skill['invocation']}\n"
+                f"Invocation: {invocation}\n\n"
             )
-            if skill.get("body"):
-                block += f"\n{skill['body']}\n"
-            block += "\n"
             if total + len(block) > MAX_SKILLS_PROMPT:
                 lines.append("(... more skills truncated)")
                 break
             lines.append(block)
             total += len(block)
         return "\n".join(lines)
+
+    def get_skill(self, name: str) -> dict[str, str] | None:
+        normalized = self._normalize_skill_name(name)
+        if not normalized:
+            return None
+        for skill in self.skills:
+            if skill.get("lookup_name") == normalized:
+                return skill
+        return None
+
+    def load_skill(self, name: str) -> str:
+        skill = self.get_skill(name)
+        if skill is None:
+            available = ", ".join(skill["name"] for skill in self.skills[:20])
+            suffix = f" Available skills: {available}" if available else ""
+            return f"Error: Skill not found: {name}.{suffix}"
+        lines = [
+            f"# Skill: {skill['name']}",
+            f"Description: {skill['description']}",
+            f"Invocation: {skill['invocation'] or '(manual)'}",
+            f"Path: {skill['path']}",
+            "",
+        ]
+        if skill.get("body"):
+            lines.append(skill["body"])
+        else:
+            lines.append("(This skill has no body content.)")
+        return truncate("\n".join(lines), MAX_SKILLS_PROMPT)
 
 
 # --------------------------------------------------------------
@@ -1080,6 +1117,7 @@ def build_system_prompt(
     agent: AgentConfig,
     runtime: AgentRuntime,
     *,
+    loaded_skills: list[str] | None = None,
     memory_context: str = "",
     mode: str = "full",
     channel: str = "cli",
@@ -1103,8 +1141,14 @@ def build_system_prompt(
         sections.append(f"## Tool Usage Guidelines\n\n{tools_md}")
 
     # 第 4 层: 技能
-    if mode == "full" and runtime.skills_block:
-        sections.append(runtime.skills_block)
+    if mode == "full" and runtime.skills_index_block:
+        sections.append(runtime.skills_index_block)
+        if loaded_skills:
+            sections.append(
+                "## Loaded Skill Context\n\n"
+                "The following skill details were loaded explicitly via the load_skill tool in this conversation.\n\n"
+                + "\n\n".join(loaded_skills)
+            )
 
     # 第 5 层: 记忆 -- 长期记忆 + 本轮自动搜索结果
     if mode == "full":
@@ -1163,6 +1207,25 @@ def _auto_recall(runtime: AgentRuntime, user_message: str) -> str:
     if not results:
         return ""
     return "\n".join(f"- [{r['path']}] {r['snippet']}" for r in results)
+
+
+def _collect_loaded_skills(messages: list[dict[str, Any]]) -> list[str]:
+    loaded: list[str] = []
+    for message in messages:
+        content = message.get("content", "")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "tool_result":
+                continue
+            text = block.get("content", "")
+            if not isinstance(text, str) or not text.startswith("# Skill: "):
+                continue
+            if text not in loaded:
+                loaded.append(text)
+    return loaded
 
 
 # -------------------------------------------------------------
@@ -1292,6 +1355,13 @@ def tool_memory_search(runtime: AgentRuntime | None, query: str, top_k: int = 5)
         f"[{result['path']}] (score: {result['score']}) {result['snippet']}"
         for result in results
     )
+
+
+def tool_load_skill(runtime: AgentRuntime | None, name: str) -> str:
+    if runtime is None:
+        return "Error: No active agent runtime for load_skill"
+    print_tool("load_skill", f"agent={runtime.agent_id} {name}")
+    return runtime.skills_mgr.load_skill(name)
 
 
 # -------------------------------------------------------------
@@ -1425,6 +1495,20 @@ TOOLS: list[ToolParam] = [
             "required": ["query"],
         },
     },
+    {
+        "name": "load_skill",
+        "description": "Load specialized knowledge by skill name.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Skill name to load",
+                }
+            },
+            "required": ["name"],
+        },
+    },
 ]
 
 TOOL_HANDLERS: dict[str, Any] = {
@@ -1435,7 +1519,7 @@ TOOL_HANDLERS: dict[str, Any] = {
     "get_current_time": tool_get_current_time,
 }
 
-MEMORY_TOOL_NAMES = {"memory_write", "memory_search"}
+MEMORY_TOOL_NAMES = {"memory_write", "memory_search", "load_skill"}
 
 
 def process_tool_call(
@@ -1454,6 +1538,14 @@ def process_tool_call(
     if tool_name == "memory_search":
         try:
             return tool_memory_search(runtime, **tool_input)
+        except TypeError as exc:
+            return f"Error: Invalid arguments for {tool_name}: {exc}"
+        except Exception as exc:
+            return f"Error: {tool_name} failed: {exc}"
+
+    if tool_name == "load_skill":
+        try:
+            return tool_load_skill(runtime, **tool_input)
         except TypeError as exc:
             return f"Error: Invalid arguments for {tool_name}: {exc}"
         except Exception as exc:
@@ -1727,7 +1819,7 @@ class AgentManager:
             workspace_dir=workspace_dir,
             bootstrap_data=bootstrap_data,
             skills_mgr=skills_mgr,
-            skills_block=skills_mgr.format_prompt_block(),
+            skills_index_block=skills_mgr.format_index_block(),
             memory_store=memory_store,
         )
         return normalized
@@ -2467,9 +2559,11 @@ def run_agent_session_turn(
         memory_context = _auto_recall(runtime, inbound.text)
         if memory_context:
             print_info(f"  [memory] auto recall hit for agent:{runtime.agent_id}")
+        loaded_skills = _collect_loaded_skills(messages)
         system_prompt = build_system_prompt(
             agent,
             runtime,
+            loaded_skills=loaded_skills,
             memory_context=memory_context,
             channel=inbound.channel or "cli",
         )
