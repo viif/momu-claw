@@ -1,4 +1,5 @@
 # momu-claw
+
 参考 claw0 实现的 Agent 网关
 
 ## 安装依赖
@@ -34,6 +35,19 @@ cp .env.example .env
 ```bash
 uv run python agent.py
 ```
+
+## agents.json 配置文件说明
+
+`agents.json` 位于项目根目录，用于定义可用 Agent 列表，当前字段建议按下面填写：
+- `id`：Agent 的唯一标识，用于内部区分与引用，建议使用简短稳定的小写英文，例如 `main`、`sage`
+- `name`：展示名称，用于界面或日志展示，例如 `Main`、`Sage`
+- `model`：该 Agent 使用的模型 ID；如果暂时希望沿用程序中的默认模型，可先留空字符串 `""`
+- `dm_scope`：私聊上下文隔离范围；当前示例使用 `per-account-channel-peer`，表示按账号 / 频道 / 对端维度隔离会话
+
+填写建议：
+- 只有一个默认 Agent 时，也建议保留数组结构，便于后续扩展
+- `id` 一旦投入使用，后续尽量不要频繁修改，避免影响已有引用或映射关系
+- 如果不同 Agent 需要不同模型，可分别填写各自的 `model`
 
 ## workspace 配置文件说明
 
