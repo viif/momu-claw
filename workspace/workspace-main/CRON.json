@@ -1,0 +1,17 @@
+{
+  "jobs": [
+    {
+      "id": "main-good-morning",
+      "name": "Say good morning",
+      "enabled": true,
+      "schedule": {
+        "kind": "cron",
+        "expr": "5 9 * * *"
+      },
+      "payload": {
+        "kind": "system_event",
+        "text": "Good morning."
+      }
+    }
+  ]
+}

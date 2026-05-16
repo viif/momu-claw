@@ -1,7 +1,4 @@
-# HEARTBEAT
+# Heartbeat checklist
 
-Runtime reminders:
-
-- Confirm the current agent and workspace first
-- Watch context size
-- Return concise results when the task is done
+- Check whether it is noon. If yes, remind the user to eat lunch.
+- If not, return `HEARTBEAT_OK`.
