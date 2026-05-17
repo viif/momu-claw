@@ -7,6 +7,7 @@
 - 五层路由绑定: peer / guild / account / channel / default
 - 会话持久化: JSONL 保存与恢复
 - 上下文保护: tool_result 截断与历史压缩
+- 弹性调用: API key 轮换 / 冷却 / 溢出恢复 / fallback model
 - 可靠投递: 出站消息先写磁盘队列, 后台重试发送
 - 多通道输入输出 (CLI + HTTP webhook)
 - 引导加载 / 系统提示词 / 技能 / 记忆 / 混合检索智能
@@ -33,6 +34,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, cast
@@ -49,6 +51,11 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 MODEL_ID = os.getenv("MODEL_ID", "claude-3-5-sonnet-20241022")
+FALLBACK_MODEL_IDS = [
+    item.strip()
+    for item in os.getenv("FALLBACK_MODEL_IDS", "").split(",")
+    if item.strip()
+]
 client = Anthropic(
     api_key=os.getenv("ANTHROPIC_API_KEY"),
     base_url=os.getenv("ANTHROPIC_BASE_URL") or None,
@@ -64,6 +71,11 @@ SYSTEM_PROMPT = (
 
 # 工具输出最大字符数 -- 防止超大输出撑爆上下文
 MAX_TOOL_OUTPUT = 50000
+
+# 弹性调用重试限制
+BASE_RETRY = 24
+PER_PROFILE = 8
+MAX_OVERFLOW_COMPACTION = 3
 
 # 工作目录
 WORKDIR = Path.cwd()
@@ -172,6 +184,10 @@ def print_session(text: str) -> None:
     print(f"{MAGENTA}{text}{RESET}")
 
 
+def print_resilience(text: str) -> None:
+    print(f"  {MAGENTA}[resilience]{RESET} {text}")
+
+
 def print_section(title: str) -> None:
     print(f"\n{MAGENTA}{BOLD}--- {title} ---{RESET}")
 
@@ -202,6 +218,100 @@ def should_mark_bootstrap_done(loader: "WorkspaceContextLoader") -> bool:
     has_identity = bool(loader.load_file("IDENTITY.md").strip())
     has_soul = bool(loader.load_file("SOUL.md").strip())
     return has_user and (has_identity or has_soul)
+
+
+# -------------------------------------------------------------
+# 弹性调用: 失败分类 / 认证配置
+# -------------------------------------------------------------
+class FailoverReason(Enum):
+    """每种原因对应不同的重试策略."""
+
+    rate_limit = "rate_limit"
+    auth = "auth"
+    timeout = "timeout"
+    billing = "billing"
+    overflow = "overflow"
+    unknown = "unknown"
+
+
+def classify_failure(exc: Exception) -> FailoverReason:
+    """检查异常字符串以确定失败类别."""
+    msg = str(exc).lower()
+    if "rate" in msg or "429" in msg:
+        return FailoverReason.rate_limit
+    if "auth" in msg or "401" in msg or "key" in msg:
+        return FailoverReason.auth
+    if "timeout" in msg or "timed out" in msg:
+        return FailoverReason.timeout
+    if "billing" in msg or "quota" in msg or "402" in msg:
+        return FailoverReason.billing
+    if "context" in msg or "token" in msg or "overflow" in msg:
+        return FailoverReason.overflow
+    return FailoverReason.unknown
+
+
+@dataclass
+class AuthProfile:
+    """表示一个可轮换使用的 API key."""
+
+    name: str
+    provider: str
+    api_key: str
+    cooldown_until: float = 0.0
+    failure_reason: str | None = None
+    last_good_at: float = 0.0
+
+
+class ProfileManager:
+    """管理 AuthProfile 池, 支持冷却感知的选择."""
+
+    def __init__(self, profiles: list[AuthProfile]):
+        self.profiles = profiles
+
+    def select_profile(self) -> AuthProfile | None:
+        now = time.time()
+        for profile in self.profiles:
+            if now >= profile.cooldown_until:
+                return profile
+        return None
+
+    def mark_failure(
+        self,
+        profile: AuthProfile,
+        reason: FailoverReason,
+        cooldown_seconds: float = 300.0,
+    ) -> None:
+        profile.cooldown_until = time.time() + cooldown_seconds
+        profile.failure_reason = reason.value
+        print_resilience(
+            f"Profile '{profile.name}' -> cooldown {cooldown_seconds:.0f}s "
+            f"(reason: {reason.value})"
+        )
+
+    def mark_success(self, profile: AuthProfile) -> None:
+        profile.failure_reason = None
+        profile.last_good_at = time.time()
+
+    def list_profiles(self) -> list[dict[str, Any]]:
+        now = time.time()
+        result = []
+        for profile in self.profiles:
+            remaining = max(0.0, profile.cooldown_until - now)
+            status = "available" if remaining == 0 else f"cooldown ({remaining:.0f}s)"
+            result.append(
+                {
+                    "name": profile.name,
+                    "provider": profile.provider,
+                    "status": status,
+                    "failure_reason": profile.failure_reason,
+                    "last_good": (
+                        time.strftime("%H:%M:%S", time.localtime(profile.last_good_at))
+                        if profile.last_good_at > 0
+                        else "never"
+                    ),
+                }
+            )
+        return result
 
 
 # -------------------------------------------------------------
@@ -1704,10 +1814,12 @@ class CronService:
         agent: AgentConfig,
         runtime: AgentRuntime,
         guard: "ContextGuard",
+        resilience_runner: "ResilienceRunner",
     ) -> None:
         self.agent = agent
         self.runtime = runtime
         self.guard = guard
+        self.resilience_runner = resilience_runner
         self.cron_file = runtime.workspace_dir / CRON_FILE_NAME
         self.jobs: list[CronJob] = []
         self._output_queue: list[str] = []
@@ -1820,6 +1932,7 @@ class CronService:
                         self.agent,
                         self.runtime,
                         self.guard,
+                        self.resilience_runner,
                         message,
                         extra_context=(
                             "You are performing a scheduled cron task. "
@@ -1926,6 +2039,7 @@ class HeartbeatRunner:
         agent: AgentConfig,
         runtime: AgentRuntime,
         guard: "ContextGuard",
+        resilience_runner: "ResilienceRunner",
         *,
         interval_seconds: int = HEARTBEAT_INTERVAL_SECONDS,
         active_hours: tuple[int, int] = HEARTBEAT_ACTIVE_HOURS,
@@ -1933,6 +2047,7 @@ class HeartbeatRunner:
         self.agent = agent
         self.runtime = runtime
         self.guard = guard
+        self.resilience_runner = resilience_runner
         self.interval_seconds = max(1, interval_seconds)
         self.active_hours = active_hours
         self.heartbeat_path = runtime.workspace_dir / "HEARTBEAT.md"
@@ -2042,6 +2157,7 @@ class HeartbeatRunner:
                 self.agent,
                 self.runtime,
                 self.guard,
+                self.resilience_runner,
                 user_text,
                 system_prompt=system_prompt,
                 channel="heartbeat",
@@ -2115,6 +2231,7 @@ def run_background_single_turn(
     agent: AgentConfig,
     runtime: AgentRuntime,
     guard: "ContextGuard",
+    resilience_runner: "ResilienceRunner",
     user_text: str,
     *,
     extra_context: str = "",
@@ -2130,13 +2247,13 @@ def run_background_single_turn(
     )
     if extra_context:
         prompt = prompt + "\n\n" + extra_context
-    response = guard.guard_api_call(
-        api_client=client,
+    _ = guard
+    messages = [{"role": "user", "content": user_text}]
+    response = resilience_runner.run_api_call(
         model=agent.effective_model,
         system=prompt,
-        messages=[{"role": "user", "content": user_text}],
+        messages=messages,
         tools=None,
-        max_retries=1,
     )
     return extract_text(response.content).strip()
 
@@ -3083,6 +3200,197 @@ class ContextGuard:
         raise RuntimeError("guard_api_call: exhausted retries")
 
 
+class ResilienceRunner:
+    """执行 Anthropic 调用, 带自动故障转移、压缩和重试."""
+
+    def __init__(
+        self,
+        profile_manager: ProfileManager,
+        fallback_models: list[str] | None = None,
+        context_guard: ContextGuard | None = None,
+    ) -> None:
+        self.profile_manager = profile_manager
+        self.fallback_models = fallback_models or []
+        self.guard = context_guard or ContextGuard()
+        num_profiles = len(profile_manager.profiles)
+        self.max_iterations = min(max(BASE_RETRY + PER_PROFILE * num_profiles, 32), 160)
+        self.total_attempts = 0
+        self.total_successes = 0
+        self.total_failures = 0
+        self.total_compactions = 0
+        self.total_rotations = 0
+
+    def run_api_call(
+        self,
+        model: str,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[ToolParam] | None = None,
+    ) -> Any:
+        current_messages = list(messages)
+        profiles_tried: set[str] = set()
+
+        for _rotation in range(len(self.profile_manager.profiles)):
+            profile = self.profile_manager.select_profile()
+            if profile is None:
+                print_warn("  All profiles on cooldown")
+                break
+            if profile.name in profiles_tried:
+                break
+            profiles_tried.add(profile.name)
+            if len(profiles_tried) > 1:
+                self.total_rotations += 1
+                print_resilience(f"Rotating to profile '{profile.name}'")
+
+            api_client = self._client_for(profile)
+            layer_messages = list(current_messages)
+            for compact_attempt in range(MAX_OVERFLOW_COMPACTION):
+                try:
+                    self.total_attempts += 1
+                    response = self._create_message(
+                        api_client, model, system, layer_messages, tools
+                    )
+                    self._sync_messages(messages, layer_messages)
+                    self.profile_manager.mark_success(profile)
+                    self.total_successes += 1
+                    return response
+                except Exception as exc:
+                    reason = classify_failure(exc)
+                    self.total_failures += 1
+                    if reason == FailoverReason.overflow:
+                        if compact_attempt < MAX_OVERFLOW_COMPACTION - 1:
+                            self.total_compactions += 1
+                            print_resilience(
+                                f"Context overflow (attempt {compact_attempt + 1}/"
+                                f"{MAX_OVERFLOW_COMPACTION}), compacting..."
+                            )
+                            layer_messages = self.guard._truncate_large_tool_results(
+                                layer_messages
+                            )
+                            layer_messages = self.guard.compact_history(
+                                layer_messages, api_client, model
+                            )
+                            continue
+                        self.profile_manager.mark_failure(
+                            profile, reason, cooldown_seconds=600
+                        )
+                        break
+                    if reason in (FailoverReason.auth, FailoverReason.billing):
+                        self.profile_manager.mark_failure(
+                            profile, reason, cooldown_seconds=300
+                        )
+                        break
+                    if reason == FailoverReason.rate_limit:
+                        self.profile_manager.mark_failure(
+                            profile, reason, cooldown_seconds=120
+                        )
+                        break
+                    if reason == FailoverReason.timeout:
+                        self.profile_manager.mark_failure(
+                            profile, reason, cooldown_seconds=60
+                        )
+                        break
+                    self.profile_manager.mark_failure(
+                        profile, reason, cooldown_seconds=120
+                    )
+                    break
+
+        for fallback_model in self.fallback_models:
+            profile = self.profile_manager.select_profile()
+            if profile is None:
+                for candidate in self.profile_manager.profiles:
+                    if candidate.failure_reason in (
+                        FailoverReason.rate_limit.value,
+                        FailoverReason.timeout.value,
+                    ):
+                        candidate.cooldown_until = 0.0
+                profile = self.profile_manager.select_profile()
+            if profile is None:
+                continue
+            print_resilience(
+                f"Fallback: model='{fallback_model}', profile='{profile.name}'"
+            )
+            api_client = self._client_for(profile)
+            try:
+                self.total_attempts += 1
+                response = self._create_message(
+                    api_client, fallback_model, system, current_messages, tools
+                )
+                self._sync_messages(messages, current_messages)
+                self.profile_manager.mark_success(profile)
+                self.total_successes += 1
+                return response
+            except Exception as exc:
+                reason = classify_failure(exc)
+                self.total_failures += 1
+                print_warn(
+                    f"  Fallback model '{fallback_model}' failed: "
+                    f"{reason.value} -- {exc}"
+                )
+
+        raise RuntimeError(
+            "All profiles and fallback models exhausted. "
+            f"Tried {len(profiles_tried)} profiles, "
+            f"{len(self.fallback_models)} fallback models."
+        )
+
+    def _client_for(self, profile: AuthProfile) -> Anthropic:
+        return Anthropic(
+            api_key=profile.api_key,
+            base_url=os.getenv("ANTHROPIC_BASE_URL") or None,
+        )
+
+    def _create_message(
+        self,
+        api_client: Anthropic,
+        model: str,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[ToolParam] | None,
+    ) -> Any:
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "max_tokens": 8096,
+            "system": system,
+            "messages": messages,
+        }
+        if tools:
+            kwargs["tools"] = tools
+        return api_client.messages.create(**kwargs)
+
+    @staticmethod
+    def _sync_messages(
+        target: list[dict[str, Any]], source: list[dict[str, Any]]
+    ) -> None:
+        if source is target:
+            return
+        target.clear()
+        target.extend(source)
+
+    def get_stats(self) -> dict[str, Any]:
+        return {
+            "total_attempts": self.total_attempts,
+            "total_successes": self.total_successes,
+            "total_failures": self.total_failures,
+            "total_compactions": self.total_compactions,
+            "total_rotations": self.total_rotations,
+            "max_iterations": self.max_iterations,
+        }
+
+
+def build_auth_profiles() -> list[AuthProfile]:
+    profile_specs = [
+        ("main-key", os.getenv("ANTHROPIC_API_KEY", "")),
+        ("backup-key", os.getenv("ANTHROPIC_API_KEY_BACKUP", "")),
+        ("emergency-key", os.getenv("ANTHROPIC_API_KEY_EMERGENCY", "")),
+    ]
+    return [
+        AuthProfile(name=name, provider="anthropic", api_key=api_key)
+        for name, api_key in profile_specs
+        if api_key
+    ]
+
+
 # -------------------------------------------------------------
 # REPL 命令
 # -------------------------------------------------------------
@@ -3273,6 +3581,7 @@ def handle_repl_command(
     bindings: BindingTable,
     delivery_queue: DeliveryQueue,
     delivery_runner: DeliveryRunner,
+    resilience_runner: ResilienceRunner,
 ) -> tuple[bool, list[dict[str, Any]], str | None]:
     parts = command.strip().split(maxsplit=1)
     cmd = parts[0].lower()
@@ -3382,6 +3691,60 @@ def handle_repl_command(
 
     if cmd in ("/delivery", "/stats"):
         cmd_delivery_stats(delivery_runner)
+        return True, messages, None
+
+    if cmd == "/profiles":
+        profiles = resilience_runner.profile_manager.list_profiles()
+        print_info("  Profiles:")
+        for profile in profiles:
+            status_color = GREEN if profile["status"] == "available" else YELLOW
+            failure = (
+                f"  failure={profile['failure_reason']}"
+                if profile["failure_reason"]
+                else ""
+            )
+            print_info(
+                f"    {profile['name']:16s} "
+                f"{status_color}{profile['status']:20s}{RESET} "
+                f"last_good={profile['last_good']}{failure}"
+            )
+        return True, messages, None
+
+    if cmd == "/cooldowns":
+        now = time.time()
+        any_active = False
+        print_info("  Active cooldowns:")
+        for profile in resilience_runner.profile_manager.profiles:
+            remaining = max(0.0, profile.cooldown_until - now)
+            if remaining > 0:
+                any_active = True
+                print_info(
+                    f"    {profile.name}: {remaining:.0f}s remaining "
+                    f"(reason: {profile.failure_reason or 'unknown'})"
+                )
+        if not any_active:
+            print_info("    No active cooldowns.")
+        return True, messages, None
+
+    if cmd == "/fallback":
+        if resilience_runner.fallback_models:
+            print_info("  Fallback model chain:")
+            for index, model in enumerate(resilience_runner.fallback_models, 1):
+                print_info(f"    {index}. {model}")
+        else:
+            print_info("  No fallback models configured.")
+        print_info(f"  Primary model default: {MODEL_ID}")
+        return True, messages, None
+
+    if cmd == "/resilience":
+        stats = resilience_runner.get_stats()
+        print_info("  Resilience stats:")
+        print_info(f"    Attempts:    {stats['total_attempts']}")
+        print_info(f"    Successes:   {stats['total_successes']}")
+        print_info(f"    Failures:    {stats['total_failures']}")
+        print_info(f"    Compactions: {stats['total_compactions']}")
+        print_info(f"    Rotations:   {stats['total_rotations']}")
+        print_info(f"    Max iter:    {stats['max_iterations']}")
         return True, messages, None
 
     if cmd == "/accounts":
@@ -3605,6 +3968,10 @@ def handle_repl_command(
         print_info("    /retry             Retry all failed deliveries")
         print_info("    /delivery          Show delivery statistics")
         print_info("    /stats             Alias for /delivery")
+        print_info("    /profiles          Show API key profile status")
+        print_info("    /cooldowns         Show active profile cooldowns")
+        print_info("    /fallback          Show fallback model chain")
+        print_info("    /resilience        Show resilience statistics")
         print_info("    /accounts          List configured accounts")
         print_info("    /agents            List registered agents")
         print_info("    /bindings          List route bindings")
@@ -3639,6 +4006,7 @@ def run_agent_session_turn(
     messages: list[dict[str, Any]],
     store: SessionStore,
     guard: ContextGuard,
+    resilience_runner: ResilienceRunner,
     mgr: ChannelManager,
 ) -> None:
     lane_lock = runtime.lane_lock
@@ -3665,8 +4033,7 @@ def run_agent_session_turn(
             )
 
             try:
-                response = guard.guard_api_call(
-                    api_client=client,
+                response = resilience_runner.run_api_call(
                     model=agent.effective_model,
                     system=system_prompt,
                     messages=messages,
@@ -3754,6 +4121,7 @@ def dispatch_inbound(
     mgr: ChannelManager,
     agent_mgr: AgentManager,
     bindings: BindingTable,
+    resilience_runner: ResilienceRunner,
 ) -> None:
     if inbound.channel == "cli":
         forced_agent_id = agent_mgr.cli_forced_agent_id or inbound.agent_id
@@ -3833,6 +4201,7 @@ def dispatch_inbound(
         messages,
         store,
         guard,
+        resilience_runner,
         mgr,
     )
 
@@ -3843,6 +4212,13 @@ def dispatch_inbound(
 def agent_loop() -> None:
     store = SessionStore()
     guard = ContextGuard()
+    profiles = build_auth_profiles()
+    profile_manager = ProfileManager(profiles)
+    resilience_runner = ResilienceRunner(
+        profile_manager=profile_manager,
+        fallback_models=FALLBACK_MODEL_IDS,
+        context_guard=guard,
+    )
     mgr = ChannelManager()
     agent_mgr = AgentManager()
     delivery_queue = DeliveryQueue()
@@ -3932,8 +4308,10 @@ def agent_loop() -> None:
         runtime = agent_mgr.get_runtime(agent.id)
         if runtime is None:
             continue
-        runtime.heartbeat_runner = HeartbeatRunner(agent, runtime, guard)
-        runtime.cron_service = CronService(agent, runtime, guard)
+        runtime.heartbeat_runner = HeartbeatRunner(
+            agent, runtime, guard, resilience_runner
+        )
+        runtime.cron_service = CronService(agent, runtime, guard, resilience_runner)
         runtime.heartbeat_runner.start()
 
         def cron_loop(rt: AgentRuntime) -> None:
@@ -3950,6 +4328,8 @@ def agent_loop() -> None:
 
     print_info("=" * 60)
     print_info(f"  Model: {MODEL_ID}")
+    print_info(f"  Profiles: {', '.join(p.name for p in profiles) or 'none'}")
+    print_info(f"  Fallback: {', '.join(FALLBACK_MODEL_IDS) or 'none'}")
     print_info(f"  Workdir: {WORKDIR}")
     print_info(f"  Agents config: {AGENTS_CONFIG_PATH.name}")
     print_info(f"  Agents loaded: {len(agent_mgr.list_agents())}")
@@ -4021,6 +4401,7 @@ def agent_loop() -> None:
                     bindings,
                     delivery_queue,
                     delivery_runner,
+                    resilience_runner,
                 )
                 if handled:
                     target_focus_key = new_focus_key or focus_key
@@ -4030,7 +4411,9 @@ def agent_loop() -> None:
                     spawn_cli_reader()
                     continue
 
-            dispatch_inbound(inbound, store, guard, mgr, agent_mgr, bindings)
+            dispatch_inbound(
+                inbound, store, guard, mgr, agent_mgr, bindings, resilience_runner
+            )
 
             if inbound.channel == "cli":
                 focus_key = agent_mgr.cli_focus_session_key or ""
