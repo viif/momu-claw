@@ -11,12 +11,13 @@
 - 可靠投递: 出站消息先写磁盘队列, 后台重试发送
 - 多通道输入输出 (CLI + HTTP webhook)
 - 引导加载 / 系统提示词 / 技能 / 记忆 / 混合检索智能
-- heartbeat 后台巡检 / cron 定时任务 / 线程协作
+- heartbeat 后台巡检 / cron 定时任务 / 命名 lane 并发调度
 """
 
 # -------------------------------------------------------------
 # 导入
 # -------------------------------------------------------------
+import concurrent.futures
 import hashlib
 import json
 import locale
@@ -31,6 +32,7 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -137,6 +139,11 @@ BOOTSTRAP_PROMPT_HEADER = (
     "Use the following instructions only for this startup conversation.\n\n"
 )
 
+# 标准 lane 名称. main 处理用户回合, cron/heartbeat 处理后台任务.
+LANE_MAIN = "main"
+LANE_CRON = "cron"
+LANE_HEARTBEAT = "heartbeat"
+
 
 # --------------------------------------------------------------
 # ANSI 颜色
@@ -177,7 +184,7 @@ def print_error(text: str) -> None:
 
 
 def print_delivery(text: str) -> None:
-    print(f"  {BLUE}[delivery]{RESET} {text}")
+    print(f"  {DIM}[delivery] {text}{RESET}")
 
 
 def print_session(text: str) -> None:
@@ -190,6 +197,10 @@ def print_resilience(text: str) -> None:
 
 def print_section(title: str) -> None:
     print(f"\n{MAGENTA}{BOLD}--- {title} ---{RESET}")
+
+
+def print_lane(lane_name: str, text: str) -> None:
+    print(f"  {DIM}[{lane_name}] {text}{RESET}")
 
 
 def extract_text(blocks: Sequence[object]) -> str:
@@ -218,6 +229,149 @@ def should_mark_bootstrap_done(loader: "WorkspaceContextLoader") -> bool:
     has_identity = bool(loader.load_file("IDENTITY.md").strip())
     has_soul = bool(loader.load_file("SOUL.md").strip())
     return has_user and (has_identity or has_soul)
+
+
+# -------------------------------------------------------------
+# 命名 lane 并发调度
+# -------------------------------------------------------------
+class LaneQueue:
+    """命名 FIFO 队列, 最多并行运行 max_concurrency 个任务."""
+
+    def __init__(self, name: str, max_concurrency: int = 1) -> None:
+        self.name = name
+        self.max_concurrency = max(1, max_concurrency)
+        self._deque: deque[tuple[Callable[[], Any], concurrent.futures.Future, int]] = (
+            deque()
+        )
+        self._condition = threading.Condition()
+        self._active_count = 0
+        self._generation = 0
+
+    @property
+    def generation(self) -> int:
+        with self._condition:
+            return self._generation
+
+    @generation.setter
+    def generation(self, value: int) -> None:
+        with self._condition:
+            self._generation = value
+            self._condition.notify_all()
+
+    def enqueue(
+        self, fn: Callable[[], Any], generation: int | None = None
+    ) -> concurrent.futures.Future:
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        with self._condition:
+            gen = generation if generation is not None else self._generation
+            self._deque.append((fn, future, gen))
+            self._pump()
+        return future
+
+    def _pump(self) -> None:
+        """调用时必须持有 self._condition."""
+        while self._active_count < self.max_concurrency and self._deque:
+            fn, future, gen = self._deque.popleft()
+            self._active_count += 1
+            thread = threading.Thread(
+                target=self._run_task,
+                args=(fn, future, gen),
+                daemon=True,
+                name=f"lane-{self.name}",
+            )
+            thread.start()
+
+    def _run_task(
+        self,
+        fn: Callable[[], Any],
+        future: concurrent.futures.Future,
+        gen: int,
+    ) -> None:
+        try:
+            future.set_result(fn())
+        except Exception as exc:
+            future.set_exception(exc)
+        finally:
+            self._task_done(gen)
+
+    def _task_done(self, gen: int) -> None:
+        with self._condition:
+            self._active_count -= 1
+            if gen == self._generation:
+                self._pump()
+            self._condition.notify_all()
+
+    def wait_for_idle(self, timeout: float | None = None) -> bool:
+        deadline = (time.monotonic() + timeout) if timeout is not None else None
+        with self._condition:
+            while self._active_count > 0 or self._deque:
+                remaining = None
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                self._condition.wait(timeout=remaining)
+            return True
+
+    def stats(self) -> dict[str, Any]:
+        with self._condition:
+            return {
+                "name": self.name,
+                "queue_depth": len(self._deque),
+                "active": self._active_count,
+                "max_concurrency": self.max_concurrency,
+                "generation": self._generation,
+            }
+
+
+class CommandQueue:
+    """中央调度器, 将 callable 路由到命名 LaneQueue."""
+
+    def __init__(self) -> None:
+        self._lanes: dict[str, LaneQueue] = {}
+        self._lock = threading.Lock()
+
+    def get_or_create_lane(self, name: str, max_concurrency: int = 1) -> LaneQueue:
+        with self._lock:
+            if name not in self._lanes:
+                self._lanes[name] = LaneQueue(name, max_concurrency)
+            return self._lanes[name]
+
+    def enqueue(
+        self, lane_name: str, fn: Callable[[], Any]
+    ) -> concurrent.futures.Future:
+        lane = self.get_or_create_lane(lane_name)
+        return lane.enqueue(fn)
+
+    def reset_all(self) -> dict[str, int]:
+        result: dict[str, int] = {}
+        with self._lock:
+            for name, lane in self._lanes.items():
+                with lane._condition:
+                    lane._generation += 1
+                    result[name] = lane._generation
+                    lane._condition.notify_all()
+        return result
+
+    def wait_for_all(self, timeout: float = 10.0) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._lock:
+            lanes = list(self._lanes.values())
+        for lane in lanes:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if not lane.wait_for_idle(timeout=remaining):
+                return False
+        return True
+
+    def stats(self) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            return {name: lane.stats() for name, lane in self._lanes.items()}
+
+    def lane_names(self) -> list[str]:
+        with self._lock:
+            return list(self._lanes.keys())
 
 
 # -------------------------------------------------------------
@@ -804,7 +958,7 @@ class AgentRuntime:
     skills_mgr: "SkillsManager"
     skills_index_block: str
     memory_store: "MemoryStore"
-    lane_lock: threading.Lock | None = None
+    command_queue: CommandQueue | None = None
     heartbeat_runner: "HeartbeatRunner | None" = None
     cron_service: "CronService | None" = None
     cron_thread: threading.Thread | None = None
@@ -1910,18 +2064,12 @@ class CronService:
         if remove_ids:
             self.jobs = [job for job in self.jobs if job.id not in remove_ids]
 
-    def _run_job(self, job: CronJob, now: float) -> None:
+    def _run_job_body(self, job: CronJob, now: float) -> tuple[str, str, str]:
         payload = job.payload
         kind = str(payload.get("kind", ""))
         output = ""
         status = "ok"
         error = ""
-        lane_lock = self.runtime.lane_lock
-        if lane_lock is None:
-            return
-        acquired = lane_lock.acquire(blocking=False)
-        if not acquired:
-            return
         try:
             if kind == "agent_turn":
                 message = str(payload.get("message", "")).strip()
@@ -1952,8 +2100,37 @@ class CronService:
                 )
         except Exception as exc:
             status, error, output = "error", str(exc), f"[cron error: {exc}]"
-        finally:
-            lane_lock.release()
+        return output, status, error
+
+    def _run_job(self, job: CronJob, now: float) -> None:
+        command_queue = self.runtime.command_queue
+        if command_queue is None:
+            return
+
+        future = command_queue.enqueue(
+            LANE_CRON,
+            lambda job=job, now=now: self._run_job_body(job, now),
+        )
+        job.next_run_at = self._compute_next(job, now)
+        print_lane(LANE_CRON, f"queued {self.agent.id}/{job.name}")
+
+        def _on_done(
+            done: concurrent.futures.Future,
+            cron_job: CronJob = job,
+            run_at: float = now,
+        ) -> None:
+            try:
+                output, status, error = done.result()
+            except Exception as exc:
+                output, status, error = f"[cron error: {exc}]", "error", str(exc)
+
+            self._finish_job(cron_job, run_at, output, status, error)
+
+        future.add_done_callback(_on_done)
+
+    def _finish_job(
+        self, job: CronJob, now: float, output: str, status: str, error: str
+    ) -> None:
 
         job.last_run_at = now
         if status == "error":
@@ -1966,7 +2143,6 @@ class CronService:
                 )
         else:
             job.consecutive_errors = 0
-        job.next_run_at = self._compute_next(job, now)
         self._append_log(job, now, status, output, error)
         if output and status != "skipped":
             with self._queue_lock:
@@ -2085,7 +2261,7 @@ class HeartbeatRunner:
         return True, instructions
 
     def should_run(self) -> tuple[bool, str]:
-        """4 项前置检查. 锁的检测在 _execute() 中单独处理."""
+        """4 项前置检查, 并感知 heartbeat lane 是否繁忙."""
         ok, reason = self._refresh_heartbeat_if_stale()
         if not ok:
             return False, reason
@@ -2103,6 +2279,12 @@ class HeartbeatRunner:
             return False, f"outside active hours ({start_hour}:00-{end_hour}:00)"
         if self.running:
             return False, "already running"
+        if self.runtime.command_queue is not None:
+            lane_stats = self.runtime.command_queue.get_or_create_lane(
+                LANE_HEARTBEAT
+            ).stats()
+            if lane_stats["active"] > 0 or lane_stats["queue_depth"] > 0:
+                return False, "heartbeat lane busy"
         return True, "all checks passed"
 
     def _parse_response(self, response: str) -> str | None:
@@ -2142,14 +2324,7 @@ class HeartbeatRunner:
         )
         return instructions, system_prompt + "\n\n" + "\n".join(extra_lines)
 
-    def _execute(self) -> None:
-        """执行一次 heartbeat 运行. 非阻塞获取锁; 如果忙则跳过."""
-        lane_lock = self.runtime.lane_lock
-        if lane_lock is None:
-            return
-        acquired = lane_lock.acquire(blocking=False)
-        if not acquired:
-            return
+    def _run_heartbeat_body(self) -> str | None:
         self.running = True
         try:
             user_text, system_prompt = self._build_prompt()
@@ -2162,15 +2337,35 @@ class HeartbeatRunner:
                 system_prompt=system_prompt,
                 channel="heartbeat",
             )
-            parsed = self._parse_response(output)
+            return self._parse_response(output)
+        finally:
+            self.running = False
+
+    def _execute(self) -> None:
+        """执行一次 heartbeat 运行, 通过 heartbeat lane 入队."""
+        command_queue = self.runtime.command_queue
+        if command_queue is None:
+            return
+
+        future = command_queue.enqueue(LANE_HEARTBEAT, self._run_heartbeat_body)
+
+        def _on_done(done: concurrent.futures.Future) -> None:
+            self.last_run_at = time.time()
+            try:
+                parsed = done.result()
+            except Exception as exc:
+                with self._queue_lock:
+                    self._output_queue.append(
+                        f"[heartbeat:{self.agent.id}] error: {exc}"
+                    )
+                return
             if parsed and parsed != self.last_output:
                 self.last_output = parsed
                 with self._queue_lock:
                     self._output_queue.append(f"[heartbeat:{self.agent.id}] {parsed}")
-            self.last_run_at = time.time()
-        finally:
-            self.running = False
-            lane_lock.release()
+                print_lane(LANE_HEARTBEAT, f"output queued ({len(parsed)} chars)")
+
+        future.add_done_callback(_on_done)
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():
@@ -2202,7 +2397,7 @@ class HeartbeatRunner:
         if self.running:
             return "heartbeat already running"
         self._execute()
-        return "heartbeat triggered"
+        return "heartbeat queued"
 
     def status(self) -> dict[str, Any]:
         ok, reason = self.should_run()
@@ -2847,6 +3042,10 @@ class AgentManager:
         skills_mgr = SkillsManager(workspace_dir)
         skills_mgr.discover()
         memory_store = MemoryStore(workspace_dir)
+        command_queue = CommandQueue()
+        command_queue.get_or_create_lane(LANE_MAIN, max_concurrency=1)
+        command_queue.get_or_create_lane(LANE_CRON, max_concurrency=1)
+        command_queue.get_or_create_lane(LANE_HEARTBEAT, max_concurrency=1)
         self._runtimes[aid] = AgentRuntime(
             agent_id=aid,
             workspace_dir=workspace_dir,
@@ -2854,7 +3053,7 @@ class AgentManager:
             skills_mgr=skills_mgr,
             skills_index_block=skills_mgr.format_index_block(),
             memory_store=memory_store,
-            lane_lock=threading.Lock(),
+            command_queue=command_queue,
         )
         return normalized
 
@@ -3862,9 +4061,55 @@ def handle_repl_command(
             print(f"{DIM}(No current agent runtime){RESET}")
             return True, messages, None
         print(f"  Agent: {runtime.agent_id}")
-        print(f"  Lane lock: {'ready' if runtime.lane_lock is not None else 'missing'}")
+        if runtime.command_queue is None:
+            print(f"{DIM}(Command queue is not initialized){RESET}")
+            return True, messages, None
+        for name, stats in runtime.command_queue.stats().items():
+            active = stats["active"]
+            max_concurrency = stats["max_concurrency"]
+            active_bar = "*" * active + "." * max(0, max_concurrency - active)
+            print(
+                f"  {name:12s} active=[{active_bar}] "
+                f"queued={stats['queue_depth']} max={max_concurrency} "
+                f"gen={stats['generation']}"
+            )
         print(f"  Heartbeat: {'on' if runtime.heartbeat_runner is not None else 'off'}")
         print(f"  Cron: {'on' if runtime.cron_service is not None else 'off'}")
+        return True, messages, None
+
+    if cmd == "/concurrency":
+        if not arg:
+            print_warn("  Usage: /concurrency <lane> <N>")
+            return True, messages, None
+        if runtime is None or runtime.command_queue is None:
+            print_warn("  Command queue is not initialized")
+            return True, messages, None
+        parts = arg.split(maxsplit=1)
+        if len(parts) < 2:
+            print_warn("  Usage: /concurrency <lane> <N>")
+            return True, messages, None
+        lane_name = parts[0]
+        try:
+            new_max = max(1, int(parts[1]))
+        except ValueError:
+            print_warn("  N must be an integer")
+            return True, messages, None
+        lane = runtime.command_queue.get_or_create_lane(lane_name)
+        old_max = lane.max_concurrency
+        lane.max_concurrency = new_max
+        with lane._condition:
+            lane._pump()
+        print_info(f"  {lane_name}: max_concurrency {old_max} -> {new_max}")
+        return True, messages, None
+
+    if cmd == "/lane-reset":
+        if runtime is None or runtime.command_queue is None:
+            print_warn("  Command queue is not initialized")
+            return True, messages, None
+        result = runtime.command_queue.reset_all()
+        print_info("  Generation incremented on all lanes:")
+        for name, generation in result.items():
+            print_info(f"    {name}: generation -> {generation}")
         return True, messages, None
 
     if cmd == "/soul":
@@ -3981,7 +4226,9 @@ def handle_repl_command(
         print_info("    /heartbeat         Show current heartbeat status")
         print_info("    /cron              List current cron jobs")
         print_info("    /cron-trigger <id> Trigger a cron job")
-        print_info("    /lanes             Show background lane status")
+        print_info("    /lanes             Show named lane status")
+        print_info("    /concurrency <lane> <N>  Change lane concurrency")
+        print_info("    /lane-reset        Increment all lane generations")
         print_info("    /soul              Show current agent SOUL.md")
         print_info("    /skills            List current agent skills")
         print_info("    /memory            Show current agent memory stats")
@@ -4009,109 +4256,104 @@ def run_agent_session_turn(
     resilience_runner: ResilienceRunner,
     mgr: ChannelManager,
 ) -> None:
-    lane_lock = runtime.lane_lock
-    if lane_lock is None:
-        lane_lock = threading.Lock()
-        runtime.lane_lock = lane_lock
-    with lane_lock:
-        loader = WorkspaceContextLoader(runtime.workspace_dir)
-        turn_input = build_bootstrap_turn_input(loader, inbound.text)
-        messages.append({"role": "user", "content": turn_input})
-        store.save_turn(session_key, "user", turn_input)
+    loader = WorkspaceContextLoader(runtime.workspace_dir)
+    turn_input = build_bootstrap_turn_input(loader, inbound.text)
+    messages.append({"role": "user", "content": turn_input})
+    store.save_turn(session_key, "user", turn_input)
 
-        while True:
-            memory_context = _auto_recall(runtime, inbound.text)
-            if memory_context:
-                print_info(f"  [memory] auto recall hit for agent:{runtime.agent_id}")
-            loaded_skills = _collect_loaded_skills(messages)
-            system_prompt = build_system_prompt(
-                agent,
-                runtime,
-                loaded_skills=loaded_skills,
-                memory_context=memory_context,
-                channel=inbound.channel or "cli",
+    while True:
+        memory_context = _auto_recall(runtime, inbound.text)
+        if memory_context:
+            print_info(f"  [memory] auto recall hit for agent:{runtime.agent_id}")
+        loaded_skills = _collect_loaded_skills(messages)
+        system_prompt = build_system_prompt(
+            agent,
+            runtime,
+            loaded_skills=loaded_skills,
+            memory_context=memory_context,
+            channel=inbound.channel or "cli",
+        )
+
+        try:
+            response = resilience_runner.run_api_call(
+                model=agent.effective_model,
+                system=system_prompt,
+                messages=messages,
+                tools=TOOLS,
             )
+        except Exception as exc:
+            print(f"\n{YELLOW}API Error: {exc}{RESET}\n")
+            while messages and messages[-1]["role"] != "user":
+                messages.pop()
+            if messages:
+                messages.pop()
+            return
 
-            try:
-                response = resilience_runner.run_api_call(
-                    model=agent.effective_model,
-                    system=system_prompt,
-                    messages=messages,
-                    tools=TOOLS,
+        messages.append({"role": "assistant", "content": response.content})
+
+        serialized_content = []
+        for block in response.content:
+            if hasattr(block, "text"):
+                serialized_content.append(
+                    {"type": "text", "text": cast(Any, block).text}
                 )
-            except Exception as exc:
-                print(f"\n{YELLOW}API Error: {exc}{RESET}\n")
-                while messages and messages[-1]["role"] != "user":
-                    messages.pop()
-                if messages:
-                    messages.pop()
-                return
+            elif is_tool_use_block(block):
+                tool_use_block = cast(Any, block)
+                serialized_content.append(
+                    {
+                        "type": "tool_use",
+                        "id": tool_use_block.id,
+                        "name": tool_use_block.name,
+                        "input": tool_use_block.input,
+                    }
+                )
+        store.save_turn(session_key, "assistant", serialized_content)
 
-            messages.append({"role": "assistant", "content": response.content})
-
-            serialized_content = []
-            for block in response.content:
-                if hasattr(block, "text"):
-                    serialized_content.append(
-                        {"type": "text", "text": cast(Any, block).text}
-                    )
-                elif is_tool_use_block(block):
-                    tool_use_block = cast(Any, block)
-                    serialized_content.append(
-                        {
-                            "type": "tool_use",
-                            "id": tool_use_block.id,
-                            "name": tool_use_block.name,
-                            "input": tool_use_block.input,
-                        }
-                    )
-            store.save_turn(session_key, "assistant", serialized_content)
-
-            if response.stop_reason == "end_turn":
-                assistant_text = extract_text(response.content)
-                if assistant_text:
-                    mgr.broadcast(inbound, assistant_text)
-                if turn_input != inbound.text and should_mark_bootstrap_done(loader):
-                    loader.mark_bootstrap_done()
-                return
-
-            if response.stop_reason == "tool_use":
-                tool_results = []
-                for block in response.content:
-                    if not is_tool_use_block(block):
-                        continue
-
-                    tool_use_block = cast(Any, block)
-                    result = process_tool_call(
-                        tool_use_block.name,
-                        tool_use_block.input,
-                        runtime=runtime,
-                    )
-                    store.save_tool_result(
-                        session_key,
-                        tool_use_block.id,
-                        tool_use_block.name,
-                        tool_use_block.input,
-                        result,
-                    )
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_block.id,
-                            "content": result,
-                        }
-                    )
-
-                messages.append({"role": "user", "content": tool_results})
-                continue
-
-            print_info(f"[stop_reason={response.stop_reason}]")
+        if response.stop_reason == "end_turn":
             assistant_text = extract_text(response.content)
             if assistant_text:
                 mgr.broadcast(inbound, assistant_text)
             if turn_input != inbound.text and should_mark_bootstrap_done(loader):
                 loader.mark_bootstrap_done()
             return
+
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            for block in response.content:
+                if not is_tool_use_block(block):
+                    continue
+
+                tool_use_block = cast(Any, block)
+                result = process_tool_call(
+                    tool_use_block.name,
+                    tool_use_block.input,
+                    runtime=runtime,
+                )
+                store.save_tool_result(
+                    session_key,
+                    tool_use_block.id,
+                    tool_use_block.name,
+                    tool_use_block.input,
+                    result,
+                )
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_block.id,
+                        "content": result,
+                    }
+                )
+
+            messages.append({"role": "user", "content": tool_results})
+            continue
+
+        print_info(f"[stop_reason={response.stop_reason}]")
+        assistant_text = extract_text(response.content)
+        if assistant_text:
+            mgr.broadcast(inbound, assistant_text)
+        if turn_input != inbound.text and should_mark_bootstrap_done(loader):
+            loader.mark_bootstrap_done()
+        return
 
 
 def dispatch_inbound(
@@ -4193,17 +4435,31 @@ def dispatch_inbound(
         raw=dict(inbound.raw),
     )
 
-    run_agent_session_turn(
-        inbound,
-        agent,
-        runtime,
-        session_key,
-        messages,
-        store,
-        guard,
-        resilience_runner,
-        mgr,
-    )
+    command_queue = runtime.command_queue
+    if command_queue is None:
+        print_warn(f"  Command queue not found for agent: {agent_id}")
+        return
+
+    def _turn() -> None:
+        run_agent_session_turn(
+            inbound,
+            agent,
+            runtime,
+            session_key,
+            messages,
+            store,
+            guard,
+            resilience_runner,
+            mgr,
+        )
+
+    future = command_queue.enqueue(LANE_MAIN, _turn)
+    print_lane(LANE_MAIN, f"queued agent={agent_id} session={session_key}")
+    if inbound.channel == "cli":
+        try:
+            future.result()
+        except Exception as exc:
+            print_warn(f"  Main lane error: {exc}")
 
 
 # -------------------------------------------------------------
@@ -4431,6 +4687,8 @@ def agent_loop() -> None:
             runtime = agent_mgr.get_runtime(agent.id)
             if runtime and runtime.heartbeat_runner is not None:
                 runtime.heartbeat_runner.stop()
+            if runtime and runtime.command_queue is not None:
+                runtime.command_queue.wait_for_all(timeout=3.0)
         delivery_runner.stop()
         mgr.close_all()
         print_info("Delivery runner stopped. Queue state preserved on disk.")
