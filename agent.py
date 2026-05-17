@@ -7,6 +7,7 @@
 - 五层路由绑定: peer / guild / account / channel / default
 - 会话持久化: JSONL 保存与恢复
 - 上下文保护: tool_result 截断与历史压缩
+- 可靠投递: 出站消息先写磁盘队列, 后台重试发送
 - 多通道输入输出 (CLI + HTTP webhook)
 - 引导加载 / 系统提示词 / 技能 / 记忆 / 混合检索智能
 - heartbeat 后台巡检 / cron 定时任务 / 线程协作
@@ -21,18 +22,20 @@ import locale
 import math
 import os
 import queue
+import random
 import re
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 from anthropic import Anthropic
 from anthropic.types import ToolParam
@@ -70,6 +73,20 @@ AGENTS_CONFIG_PATH = WORKDIR / "agents.json"
 # 会话目录与上下文保护阈值
 SESSIONS_DIR = WORKDIR / ".sessions"
 CONTEXT_SAFE_LIMIT = 180000
+
+# 可靠投递队列
+DELIVERY_QUEUE_DIR = WORKSPACE_DIR / "delivery-queue"
+BACKOFF_MS = [5_000, 25_000, 120_000, 600_000]
+MAX_DELIVERY_RETRIES = 5
+CHANNEL_LIMITS: dict[str, int] = {
+    "telegram": 4096,
+    "telegram_caption": 1024,
+    "discord": 2000,
+    "whatsapp": 4096,
+    "cli": 4096,
+    "http": 4096,
+    "default": 4096,
+}
 
 # HTTP Webhook 配置
 HTTP_WEBHOOK_HOST = os.getenv("HTTP_WEBHOOK_HOST", "127.0.0.1")
@@ -143,6 +160,14 @@ def print_warn(text: str) -> None:
     print(f"{YELLOW}{text}{RESET}")
 
 
+def print_error(text: str) -> None:
+    print(f"{RED}{text}{RESET}")
+
+
+def print_delivery(text: str) -> None:
+    print(f"  {BLUE}[delivery]{RESET} {text}")
+
+
 def print_session(text: str) -> None:
     print(f"{MAGENTA}{text}{RESET}")
 
@@ -177,6 +202,345 @@ def should_mark_bootstrap_done(loader: "WorkspaceContextLoader") -> bool:
     has_identity = bool(loader.load_file("IDENTITY.md").strip())
     has_soul = bool(loader.load_file("SOUL.md").strip())
     return has_user and (has_identity or has_soul)
+
+
+# -------------------------------------------------------------
+# 可靠投递队列
+# -------------------------------------------------------------
+@dataclass
+class QueuedDelivery:
+    id: str
+    channel: str
+    to: str
+    text: str
+    agent_id: str = ""
+    session_key: str = ""
+    retry_count: int = 0
+    last_error: str | None = None
+    enqueued_at: float = field(default_factory=time.time)
+    next_retry_at: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "channel": self.channel,
+            "to": self.to,
+            "text": self.text,
+            "agent_id": self.agent_id,
+            "session_key": self.session_key,
+            "retry_count": self.retry_count,
+            "last_error": self.last_error,
+            "enqueued_at": self.enqueued_at,
+            "next_retry_at": self.next_retry_at,
+        }
+
+    @staticmethod
+    def from_dict(data: dict[str, Any]) -> "QueuedDelivery":
+        return QueuedDelivery(
+            id=str(data["id"]),
+            channel=str(data["channel"]),
+            to=str(data["to"]),
+            text=str(data["text"]),
+            agent_id=str(data.get("agent_id", "")),
+            session_key=str(data.get("session_key", "")),
+            retry_count=int(data.get("retry_count", 0)),
+            last_error=data.get("last_error"),
+            enqueued_at=float(data.get("enqueued_at", 0.0)),
+            next_retry_at=float(data.get("next_retry_at", 0.0)),
+        )
+
+
+def compute_backoff_ms(retry_count: int) -> int:
+    """指数退避, 加 +/- 20% 抖动以避免惊群效应."""
+    if retry_count <= 0:
+        return 0
+    index = min(retry_count - 1, len(BACKOFF_MS) - 1)
+    base = BACKOFF_MS[index]
+    jitter = random.randint(-base // 5, base // 5)
+    return max(0, base + jitter)
+
+
+class DeliveryQueue:
+    """磁盘持久化投递队列: 先写入磁盘, 再尝试投递."""
+
+    def __init__(self, queue_dir: Path | None = None) -> None:
+        self.queue_dir = queue_dir or DELIVERY_QUEUE_DIR
+        self.failed_dir = self.queue_dir / "failed"
+        self.queue_dir.mkdir(parents=True, exist_ok=True)
+        self.failed_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+
+    def enqueue(
+        self,
+        channel: str,
+        to: str,
+        text: str,
+        *,
+        agent_id: str = "",
+        session_key: str = "",
+    ) -> str:
+        delivery_id = uuid.uuid4().hex[:12]
+        entry = QueuedDelivery(
+            id=delivery_id,
+            channel=channel,
+            to=to,
+            text=text,
+            agent_id=normalize_agent_id(agent_id) if agent_id else "",
+            session_key=session_key,
+            enqueued_at=time.time(),
+            next_retry_at=0.0,
+        )
+        self._write_entry(entry)
+        return delivery_id
+
+    def _write_entry(self, entry: QueuedDelivery) -> None:
+        final_path = self.queue_dir / f"{entry.id}.json"
+        tmp_path = self.queue_dir / f".tmp.{os.getpid()}.{entry.id}.json"
+        data = json.dumps(entry.to_dict(), indent=2, ensure_ascii=False)
+        with self._lock:
+            with open(tmp_path, "w", encoding="utf-8") as file:
+                file.write(data)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(str(tmp_path), str(final_path))
+
+    def _read_entry(self, delivery_id: str) -> QueuedDelivery | None:
+        file_path = self.queue_dir / f"{delivery_id}.json"
+        if not file_path.exists():
+            return None
+        try:
+            with open(file_path, "r", encoding="utf-8") as file:
+                data = json.load(file)
+            if not isinstance(data, dict):
+                return None
+            return QueuedDelivery.from_dict(data)
+        except (json.JSONDecodeError, KeyError, OSError, TypeError, ValueError):
+            return None
+
+    def ack(self, delivery_id: str) -> None:
+        file_path = self.queue_dir / f"{delivery_id}.json"
+        try:
+            file_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def fail(self, delivery_id: str, error: str) -> None:
+        entry = self._read_entry(delivery_id)
+        if entry is None:
+            return
+        entry.retry_count += 1
+        entry.last_error = error
+        if entry.retry_count >= MAX_DELIVERY_RETRIES:
+            self.move_to_failed(delivery_id)
+            return
+        backoff_ms = compute_backoff_ms(entry.retry_count)
+        entry.next_retry_at = time.time() + backoff_ms / 1000.0
+        self._write_entry(entry)
+
+    def move_to_failed(self, delivery_id: str) -> None:
+        src = self.queue_dir / f"{delivery_id}.json"
+        dst = self.failed_dir / f"{delivery_id}.json"
+        try:
+            os.replace(str(src), str(dst))
+        except FileNotFoundError:
+            pass
+
+    def load_pending(self) -> list[QueuedDelivery]:
+        entries: list[QueuedDelivery] = []
+        if not self.queue_dir.exists():
+            return entries
+        for file_path in self.queue_dir.glob("*.json"):
+            if not file_path.is_file():
+                continue
+            try:
+                with open(file_path, "r", encoding="utf-8") as file:
+                    data = json.load(file)
+                if isinstance(data, dict):
+                    entries.append(QueuedDelivery.from_dict(data))
+            except (json.JSONDecodeError, KeyError, OSError, TypeError, ValueError):
+                continue
+        entries.sort(key=lambda entry: entry.enqueued_at)
+        return entries
+
+    def load_failed(self) -> list[QueuedDelivery]:
+        entries: list[QueuedDelivery] = []
+        if not self.failed_dir.exists():
+            return entries
+        for file_path in self.failed_dir.glob("*.json"):
+            if not file_path.is_file():
+                continue
+            try:
+                with open(file_path, "r", encoding="utf-8") as file:
+                    data = json.load(file)
+                if isinstance(data, dict):
+                    entries.append(QueuedDelivery.from_dict(data))
+            except (json.JSONDecodeError, KeyError, OSError, TypeError, ValueError):
+                continue
+        entries.sort(key=lambda entry: entry.enqueued_at)
+        return entries
+
+    def retry_failed(self) -> int:
+        count = 0
+        if not self.failed_dir.exists():
+            return count
+        for file_path in self.failed_dir.glob("*.json"):
+            if not file_path.is_file():
+                continue
+            try:
+                with open(file_path, "r", encoding="utf-8") as file:
+                    data = json.load(file)
+                if not isinstance(data, dict):
+                    continue
+                entry = QueuedDelivery.from_dict(data)
+                entry.retry_count = 0
+                entry.last_error = None
+                entry.next_retry_at = 0.0
+                self._write_entry(entry)
+                file_path.unlink()
+                count += 1
+            except (json.JSONDecodeError, KeyError, OSError, TypeError, ValueError):
+                continue
+        return count
+
+
+def chunk_message(text: str, channel: str = "default") -> list[str]:
+    """将消息按平台限制分片. 两级拆分: 段落, 然后硬切."""
+    if not text:
+        return []
+    limit = CHANNEL_LIMITS.get(channel, CHANNEL_LIMITS["default"])
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    for para in text.split("\n\n"):
+        if chunks and len(chunks[-1]) + len(para) + 2 <= limit:
+            chunks[-1] += "\n\n" + para
+        else:
+            while len(para) > limit:
+                chunks.append(para[:limit])
+                para = para[limit:]
+            if para:
+                chunks.append(para)
+    return chunks or [text[:limit]]
+
+
+class DeliveryRunner:
+    def __init__(
+        self,
+        delivery_queue: DeliveryQueue,
+        deliver_fn: Callable[[str, str, str], None],
+    ) -> None:
+        self.delivery_queue = delivery_queue
+        self.deliver_fn = deliver_fn
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.total_attempted = 0
+        self.total_succeeded = 0
+        self.total_failed = 0
+
+    def start(self) -> None:
+        self._recovery_scan()
+        self._thread = threading.Thread(
+            target=self._background_loop,
+            daemon=True,
+            name="delivery-runner",
+        )
+        self._thread.start()
+
+    def _recovery_scan(self) -> None:
+        pending = self.delivery_queue.load_pending()
+        failed = self.delivery_queue.load_failed()
+        parts = []
+        if pending:
+            parts.append(f"{len(pending)} pending")
+        if failed:
+            parts.append(f"{len(failed)} failed")
+        print_delivery(
+            f"Recovery: {', '.join(parts)}" if parts else "Recovery: queue is clean"
+        )
+
+    def _background_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self._process_pending()
+            except Exception as exc:
+                print_error(f"  [delivery] loop error: {exc}")
+            self._stop_event.wait(timeout=1.0)
+
+    def _process_pending(
+        self,
+        channel: str | None = None,
+        to: str | None = None,
+        agent_id: str | None = None,
+        session_key: str | None = None,
+    ) -> None:
+        pending = self.delivery_queue.load_pending()
+        now = time.time()
+        for entry in pending:
+            if self._stop_event.is_set():
+                break
+            if channel is not None and entry.channel != channel:
+                continue
+            if to is not None and entry.to != to:
+                continue
+            if agent_id is not None and entry.agent_id != normalize_agent_id(agent_id):
+                continue
+            if session_key is not None and entry.session_key != session_key:
+                continue
+            if entry.next_retry_at > now:
+                continue
+            self.total_attempted += 1
+            try:
+                self.deliver_fn(entry.channel, entry.to, entry.text)
+                self.delivery_queue.ack(entry.id)
+                self.total_succeeded += 1
+            except Exception as exc:
+                error_msg = str(exc)
+                self.delivery_queue.fail(entry.id, error_msg)
+                self.total_failed += 1
+                next_retry = entry.retry_count + 1
+                if next_retry >= MAX_DELIVERY_RETRIES:
+                    print_warn(
+                        f"  [delivery] {entry.id[:8]}... -> failed/ "
+                        f"(retry {next_retry}/{MAX_DELIVERY_RETRIES}): {error_msg}"
+                    )
+                else:
+                    backoff = compute_backoff_ms(next_retry)
+                    print_warn(
+                        f"  [delivery] {entry.id[:8]}... failed "
+                        f"(retry {next_retry}/{MAX_DELIVERY_RETRIES}), "
+                        f"next retry in {backoff / 1000:.0f}s: {error_msg}"
+                    )
+
+    def process_ready_once(
+        self,
+        channel: str | None = None,
+        to: str | None = None,
+        agent_id: str | None = None,
+        session_key: str | None = None,
+    ) -> None:
+        """同步处理一次已到期投递, 用于 CLI 重新显示提示符前刷新输出."""
+        self._process_pending(
+            channel=channel,
+            to=to,
+            agent_id=agent_id,
+            session_key=session_key,
+        )
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3.0)
+
+    def get_stats(self) -> dict[str, int]:
+        pending = self.delivery_queue.load_pending()
+        failed = self.delivery_queue.load_failed()
+        return {
+            "pending": len(pending),
+            "failed": len(failed),
+            "total_attempted": self.total_attempted,
+            "total_succeeded": self.total_succeeded,
+            "total_failed": self.total_failed,
+        }
 
 
 # -------------------------------------------------------------
@@ -548,6 +912,7 @@ class ChannelManager:
     def __init__(self) -> None:
         self.channels: dict[str, Channel] = {}
         self.accounts: list[ChannelAccount] = []
+        self.delivery_queue: DeliveryQueue | None = None
 
     def register(self, channel: Channel) -> None:
         self.channels[channel.name] = channel
@@ -558,12 +923,37 @@ class ChannelManager:
     def get(self, name: str) -> Channel | None:
         return self.channels.get(name)
 
+    def set_delivery_queue(self, delivery_queue: DeliveryQueue) -> None:
+        self.delivery_queue = delivery_queue
+
     def broadcast(self, inbound: InboundMessage, text: str) -> None:
-        target = self.get(inbound.channel) or self.get("cli")
-        if target is not None:
-            target.send(
-                inbound.reply_to or inbound.peer_id, text, **inbound.reply_kwargs
+        channel_name = inbound.channel or "cli"
+        to = inbound.reply_to or inbound.peer_id
+        if self.delivery_queue is None:
+            target = self.get(channel_name) or self.get("cli")
+            if target is not None:
+                target.send(to, text, **inbound.reply_kwargs)
+            return
+        for chunk in chunk_message(text, channel_name):
+            delivery_id = self.delivery_queue.enqueue(
+                channel_name,
+                to,
+                chunk,
+                agent_id=inbound.agent_id,
+                session_key=inbound.session_key,
             )
+            print_delivery(
+                f"queued {delivery_id[:8]}... channel={channel_name} to={to} "
+                f"agent={inbound.agent_id or '-'}"
+            )
+
+    def deliver_now(self, channel_name: str, to: str, text: str) -> None:
+        target = self.get(channel_name) or self.get("cli")
+        if target is None:
+            raise RuntimeError(f"Channel not found: {channel_name}")
+        ok = target.send(to, text)
+        if not ok:
+            raise RuntimeError(f"Channel send failed: {channel_name}")
 
     def close_all(self) -> None:
         for channel in self.channels.values():
@@ -2776,6 +3166,52 @@ def cmd_sessions(
         )
 
 
+def cmd_delivery_queue(delivery_queue: DeliveryQueue) -> None:
+    pending = delivery_queue.load_pending()
+    if not pending:
+        print_info("  Queue is empty.")
+        return
+    print_info(f"  Pending deliveries ({len(pending)}):")
+    now = time.time()
+    for entry in pending:
+        wait = ""
+        if entry.next_retry_at > now:
+            remaining = entry.next_retry_at - now
+            wait = f", wait {remaining:.0f}s"
+        preview = entry.text[:40].replace("\n", " ")
+        print_info(
+            f"    {entry.id[:8]}... channel={entry.channel} to={entry.to} "
+            f'retry={entry.retry_count}{wait} "{preview}"'
+        )
+
+
+def cmd_delivery_failed(delivery_queue: DeliveryQueue) -> None:
+    failed = delivery_queue.load_failed()
+    if not failed:
+        print_info("  No failed deliveries.")
+        return
+    print_info(f"  Failed deliveries ({len(failed)}):")
+    for entry in failed:
+        preview = entry.text[:40].replace("\n", " ")
+        error = entry.last_error or "unknown"
+        print_info(
+            f"    {entry.id[:8]}... channel={entry.channel} to={entry.to} "
+            f'retries={entry.retry_count} error="{error[:30]}" "{preview}"'
+        )
+
+
+def cmd_delivery_stats(runner: DeliveryRunner) -> None:
+    stats = runner.get_stats()
+    print_info(
+        "  Delivery stats: "
+        f"pending={stats['pending']}, "
+        f"failed={stats['failed']}, "
+        f"attempted={stats['total_attempted']}, "
+        f"succeeded={stats['total_succeeded']}, "
+        f"errors={stats['total_failed']}"
+    )
+
+
 def current_cli_runtime(agent_mgr: AgentManager) -> AgentRuntime | None:
     if agent_mgr.cli_forced_agent_id:
         return agent_mgr.get_runtime(agent_mgr.cli_forced_agent_id)
@@ -2786,17 +3222,45 @@ def current_cli_runtime(agent_mgr: AgentManager) -> AgentRuntime | None:
     return agent_mgr.get_runtime(DEFAULT_AGENT_ID)
 
 
-def drain_background_outputs(agent_mgr: AgentManager) -> None:
+def drain_background_outputs(
+    agent_mgr: AgentManager, delivery_queue: DeliveryQueue | None = None
+) -> None:
     for agent in agent_mgr.list_agents():
         runtime = agent_mgr.get_runtime(agent.id)
         if runtime is None:
             continue
         if runtime.heartbeat_runner is not None:
             for item in runtime.heartbeat_runner.drain_output():
-                print_assistant(item)
+                if delivery_queue is None:
+                    print_assistant(item)
+                else:
+                    for chunk in chunk_message(item, "cli"):
+                        delivery_id = delivery_queue.enqueue(
+                            "cli",
+                            "cli-user",
+                            chunk,
+                            agent_id=agent.id,
+                        )
+                        print_delivery(
+                            f"queued {delivery_id[:8]}... channel=cli to=cli-user "
+                            f"agent={agent.id}"
+                        )
         if runtime.cron_service is not None:
             for item in runtime.cron_service.drain_output():
-                print_assistant(item)
+                if delivery_queue is None:
+                    print_assistant(item)
+                else:
+                    for chunk in chunk_message(item, "cli"):
+                        delivery_id = delivery_queue.enqueue(
+                            "cli",
+                            "cli-user",
+                            chunk,
+                            agent_id=agent.id,
+                        )
+                        print_delivery(
+                            f"queued {delivery_id[:8]}... channel=cli to=cli-user "
+                            f"agent={agent.id}"
+                        )
 
 
 def handle_repl_command(
@@ -2807,6 +3271,8 @@ def handle_repl_command(
     mgr: ChannelManager,
     agent_mgr: AgentManager,
     bindings: BindingTable,
+    delivery_queue: DeliveryQueue,
+    delivery_runner: DeliveryRunner,
 ) -> tuple[bool, list[dict[str, Any]], str | None]:
     parts = command.strip().split(maxsplit=1)
     cmd = parts[0].lower()
@@ -2899,6 +3365,23 @@ def handle_repl_command(
         print_info("  Channels:")
         for name in mgr.list_channels():
             print_info(f"    {name}")
+        return True, messages, None
+
+    if cmd == "/queue":
+        cmd_delivery_queue(delivery_queue)
+        return True, messages, None
+
+    if cmd == "/failed":
+        cmd_delivery_failed(delivery_queue)
+        return True, messages, None
+
+    if cmd == "/retry":
+        count = delivery_queue.retry_failed()
+        print_info(f"  Moved {count} entries back to queue.")
+        return True, messages, None
+
+    if cmd in ("/delivery", "/stats"):
+        cmd_delivery_stats(delivery_runner)
         return True, messages, None
 
     if cmd == "/accounts":
@@ -3117,6 +3600,11 @@ def handle_repl_command(
         print_info("    /context           Show context token usage")
         print_info("    /compact           Manually compact conversation history")
         print_info("    /channels          List registered channels")
+        print_info("    /queue             Show pending deliveries")
+        print_info("    /failed            Show failed deliveries")
+        print_info("    /retry             Retry all failed deliveries")
+        print_info("    /delivery          Show delivery statistics")
+        print_info("    /stats             Alias for /delivery")
         print_info("    /accounts          List configured accounts")
         print_info("    /agents            List registered agents")
         print_info("    /bindings          List route bindings")
@@ -3322,6 +3810,21 @@ def dispatch_inbound(
         f"  [session] agent={agent_id} workspace={agent.workspace_dir} key={session_key}"
     )
 
+    inbound = InboundMessage(
+        text=inbound.text,
+        sender_id=inbound.sender_id,
+        channel=inbound.channel,
+        account_id=inbound.account_id,
+        peer_id=inbound.peer_id,
+        guild_id=inbound.guild_id,
+        agent_id=agent_id,
+        session_key=session_key,
+        is_group=inbound.is_group,
+        reply_to=inbound.reply_to,
+        reply_kwargs=dict(inbound.reply_kwargs),
+        raw=dict(inbound.raw),
+    )
+
     run_agent_session_turn(
         inbound,
         agent,
@@ -3342,6 +3845,13 @@ def agent_loop() -> None:
     guard = ContextGuard()
     mgr = ChannelManager()
     agent_mgr = AgentManager()
+    delivery_queue = DeliveryQueue()
+    mgr.set_delivery_queue(delivery_queue)
+
+    def deliver_fn(channel_name: str, to: str, text: str) -> None:
+        mgr.deliver_now(channel_name, to, text)
+
+    delivery_runner = DeliveryRunner(delivery_queue, deliver_fn)
 
     for config in load_agents_config():
         agent_mgr.register(config)
@@ -3376,6 +3886,7 @@ def agent_loop() -> None:
     http_channel = HTTPWebhookChannel(http_account)
     mgr.register(http_channel)
     http_channel.start()
+    delivery_runner.start()
 
     cli_queue: queue.Queue[InboundMessage | None] = queue.Queue()
     cli_reader_thread: threading.Thread | None = None
@@ -3468,6 +3979,7 @@ def agent_loop() -> None:
         f"  Tools: {', '.join(list(TOOL_HANDLERS.keys()) + sorted(MEMORY_TOOL_NAMES))}"
     )
     print_info(f"  Channels: {', '.join(mgr.list_channels())}")
+    print_info(f"  Delivery Queue: {DELIVERY_QUEUE_DIR}")
     print_info(
         f"  HTTP Webhook: http://{HTTP_WEBHOOK_HOST}:{HTTP_WEBHOOK_PORT}{HTTP_WEBHOOK_PATH}"
     )
@@ -3479,7 +3991,7 @@ def agent_loop() -> None:
 
     try:
         while True:
-            drain_background_outputs(agent_mgr)
+            drain_background_outputs(agent_mgr, delivery_queue)
             inbound = http_channel.receive()
             if inbound is None:
                 try:
@@ -3507,6 +4019,8 @@ def agent_loop() -> None:
                     mgr,
                     agent_mgr,
                     bindings,
+                    delivery_queue,
+                    delivery_runner,
                 )
                 if handled:
                     target_focus_key = new_focus_key or focus_key
@@ -3519,13 +4033,24 @@ def agent_loop() -> None:
             dispatch_inbound(inbound, store, guard, mgr, agent_mgr, bindings)
 
             if inbound.channel == "cli":
+                focus_key = agent_mgr.cli_focus_session_key or ""
+                delivery_runner.process_ready_once(
+                    channel="cli",
+                    to="cli-user",
+                    agent_id=agent_id_from_session_key(focus_key)
+                    if focus_key
+                    else None,
+                    session_key=focus_key or None,
+                )
                 spawn_cli_reader()
     finally:
         for agent in agent_mgr.list_agents():
             runtime = agent_mgr.get_runtime(agent.id)
             if runtime and runtime.heartbeat_runner is not None:
                 runtime.heartbeat_runner.stop()
+        delivery_runner.stop()
         mgr.close_all()
+        print_info("Delivery runner stopped. Queue state preserved on disk.")
 
 
 # -------------------------------------------------------------
